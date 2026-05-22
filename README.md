@@ -1,14 +1,14 @@
 # rusty-serp
 
-A Rust-based Cloudflare Worker that serves as a stateless HTTP proxy to the [DataForSEO](https://dataforseo.com/) SERP Google Organic Live Advanced API. It provides a unified, authenticated endpoint that Graph Agents call as a tool to retrieve live Google SERP data — including AI Overviews, organic results, People Also Ask, and related searches.
+A Rust-based Cloudflare Worker that serves as a stateless HTTP proxy to the [DataForSEO](https://dataforseo.com/) SERP Google Organic Live Advanced API. It provides a unified, authenticated endpoint that Graph Agents call as a tool to retrieve live Google SERP data, including AI Overviews, organic results, People Also Ask, and related searches.
 
 ## Why rusty-serp Exists
 
 Graph Agents operating across multiple orchestration frameworks (LangGraph, LangChain, Deep Agents) need a consistent, low-latency, globally distributed interface to fetch live SERP data. Directly embedding DataForSEO credentials and API logic into each agent creates three problems:
 
-1. **Credential sprawl** — every agent framework, every deployment, every developer needs a copy of the DataForSEO API credentials
-2. **Inconsistent error handling** — each integration handles timeouts, auth failures, and malformed responses differently
-3. **Duplicated integration code** — the same request construction, validation, and response handling logic gets reimplemented across Python, TypeScript, and other agent runtimes
+1. **Credential sprawl**: every agent framework, every deployment, every developer needs a copy of the DataForSEO API credentials
+2. **Inconsistent error handling**: each integration handles timeouts, auth failures, and malformed responses differently
+3. **Duplicated integration code**: the same request construction, validation, and response handling logic gets reimplemented across Python, TypeScript, and other agent runtimes
 
 rusty-serp centralizes all of this behind a single HTTP endpoint. Agents send a simple JSON POST with a keyword and location; rusty-serp handles authentication, request construction, endpoint selection, and error normalization.
 
@@ -39,7 +39,7 @@ rusty-serp centralizes all of this behind a single HTTP endpoint. Agents send a 
 3. Worker parses and validates the request body (keyword, location, depth, device, language, ai_optimized)
 4. Worker constructs the DataForSEO request with Basic Auth and always sets `load_async_ai_overview: true`
 5. Worker selects the standard or AI-optimized endpoint based on the `ai_optimized` flag
-6. Worker returns the DataForSEO response verbatim — no transformation, no filtering
+6. Worker returns the DataForSEO response verbatim, without transformation or filtering
 
 ### Module Structure
 
@@ -61,7 +61,7 @@ rusty-serp compiles directly to `wasm32-unknown-unknown` via `worker-build`. The
 
 ### Error-as-Value
 
-Every function in the request pipeline returns `Result<T, Response>` where the `Err` variant is an already-constructed HTTP error response — not a custom error type. This eliminates the need for error type hierarchies, `.into()` conversions, or centralized error-to-response mapping. When something fails, the error *is* the response.
+Every function in the request pipeline returns `Result<T, Response>` where the `Err` variant is an already-constructed HTTP error response, not a custom error type. This eliminates the need for error type hierarchies, `.into()` conversions, or centralized error-to-response mapping. When something fails, the error *is* the response.
 
 ### Fail-Early Chain
 
@@ -135,11 +135,11 @@ curl -X POST "https://rusty-serp.example.com/v1/serp?csvkey=your-secret-key" \
 | `depth` | integer | No | `10` | Number of results to retrieve (1-700). Charged per 10 by DataForSEO. |
 | `device` | string | No | `"desktop"` | `"desktop"` or `"mobile"` (case-insensitive). |
 | `language` | string | No | `"en"` | Language code (e.g., `"en"`, `"es"`, `"fr"`, `"de"`). |
-| `ai_optimized` | boolean | No | `false` | When `true`, calls the `.ai` endpoint for a flattened, token-efficient response. Must be a JSON boolean — strings like `"true"` are rejected. |
+| `ai_optimized` | boolean | No | `false` | When `true`, calls the `.ai` endpoint for a flattened, token-efficient response. Must be a JSON boolean; strings like `"true"` are rejected. |
 
-**Location field behavior:** Type detection is based strictly on the JSON value type. An integer like `2840` maps to `location_code`. A string like `"United States"` maps to `location_name`. A string like `"2840"` is treated as a location *name*, not a code — the Worker does not attempt to parse strings as integers.
+**Location field behavior:** Type detection is based strictly on the JSON value type. An integer like `2840` maps to `location_code`. A string like `"United States"` maps to `location_name`. A string like `"2840"` is treated as a location *name*, not a code. The Worker does not attempt to parse strings as integers.
 
-**Response:** `200 OK` with DataForSEO response body passed through verbatim. The HTTP status is always `200` for successful upstream calls — check the `status_code` field in the JSON body for DataForSEO-level success or failure (`20000` = success).
+**Response:** `200 OK` with DataForSEO response body passed through verbatim. The HTTP status is always `200` for successful upstream calls; check the `status_code` field in the JSON body for DataForSEO-level success or failure (`20000` = success).
 
 ### Error Responses
 
@@ -246,7 +246,7 @@ serp_tool = Tool(
 - **Use `ai_optimized: true` by default** when agents consume SERP data for analysis. The flat structure with stripped null fields reduces token usage significantly.
 - **Use `ai_optimized: false`** when agents need full metadata (rectangles, XPath, position data, cost breakdown).
 - **Set `depth` conservatively.** Start with `10` (default). Each additional 10 results adds ~$0.002.
-- **Check `status_code` in the response body.** A `200` HTTP response does not guarantee SERP success — look for `20000` in the JSON.
+- **Check `status_code` in the response body.** A `200` HTTP response does not guarantee SERP success; look for `20000` in the JSON.
 - **Set agent tool timeout to 120+ seconds.** DataForSEO Live mode can take up to 120 seconds for complex queries.
 - **Handle non-JSON timeouts.** If Cloudflare's wall-clock limit kills the Worker, agents receive a `524` HTML error page or connection reset, not a JSON response.
 
@@ -304,7 +304,7 @@ wrangler deploy --env production
 wrangler deploy --env staging
 ```
 
-A bare `wrangler deploy` (no `--env`) deploys to `rusty-serp-dev`, not production. This is intentional — the top-level name in `wrangler.toml` differs from the production name to prevent accidental production deployments.
+A bare `wrangler deploy` (no `--env`) deploys to `rusty-serp-dev`, not production. This is by design; the top-level name in `wrangler.toml` differs from the production name to prevent accidental production deployments.
 
 ### Environment Names
 
