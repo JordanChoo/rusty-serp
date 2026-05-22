@@ -3,4 +3,5 @@
 target/
 build/
 node_modules/
+.wrangler/
 .claude/settings.local.json
