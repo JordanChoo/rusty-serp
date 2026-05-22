@@ -1,0 +1,6 @@
+.env
+.dev.vars
+target/
+build/
+node_modules/
+.claude/settings.local.json
