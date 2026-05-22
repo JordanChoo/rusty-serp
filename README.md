@@ -306,6 +306,29 @@ wrangler deploy --env staging
 
 A bare `wrangler deploy` (no `--env`) deploys to `rusty-serp-dev`, not production. This is by design; the top-level name in `wrangler.toml` differs from the production name to prevent accidental production deployments.
 
+### Deploying via the Cloudflare Dashboard
+
+If you prefer not to use the Wrangler CLI, you can deploy directly through the Cloudflare dashboard by connecting your GitHub repository.
+
+1. Log in to the [Cloudflare dashboard](https://dash.cloudflare.com/) and navigate to **Workers & Pages**.
+2. Click **Create** and select **Import a repository**.
+3. Connect your GitHub account if you haven't already, then select the `rusty-serp` repository.
+4. Configure the build settings:
+   - **Build command:** leave empty (`wrangler.toml` defines the build command, which includes installing Rust if needed)
+   - **Deploy command:** `npx wrangler deploy`
+   - **Root directory:** leave empty (the project root contains `Cargo.toml` and `wrangler.toml`)
+5. Click **Deploy**. Cloudflare will clone the repo, compile the Rust source to WebAssembly, and deploy the Worker.
+6. After the first deploy completes, go to **Settings > Variables and Secrets** for the Worker and add the three required secrets:
+   - `CSVKEY`
+   - `DATAFORSEO_LOGIN`
+   - `DATAFORSEO_PASSWORD`
+
+   Click **Encrypt** for each value to store them as encrypted secrets.
+
+With this setup, every push to `main` triggers an automatic rebuild and deploy. You can disable automatic deployments or limit them to specific branches under **Settings > Builds & Deployments**.
+
+To roll back a deployment, navigate to **Workers & Pages > rusty-serp > Deployments**, find the version you want, and click **Rollback**.
+
 ### Environment Names
 
 | Command | Worker Name | Purpose |
