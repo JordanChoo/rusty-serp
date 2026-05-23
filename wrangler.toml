@@ -1,4 +1,4 @@
-name = "rusty-serp-dev"
+name = "rusty-serp"
 main = "build/worker/shim.mjs"
 compatibility_date = "2026-05-03"
 
