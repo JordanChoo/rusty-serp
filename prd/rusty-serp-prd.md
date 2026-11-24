@@ -83,7 +83,7 @@ Adapted from the architecture patterns established in [rusty-gateway](https://gi
 8. Worker validates all fields against schema (reject invalid with 400):
    - keyword: required, string, non-empty, <= 700 chars
    - location: required, integer (location_code) or string (location_name)
-   - depth: optional, integer 1-700, default 10
+   - depth: optional, integer 1-200, default 10
    - device: optional, "desktop" or "mobile", default "desktop"
    - language: optional, non-empty string, default "en"
    - ai_optimized: optional, must be boolean if present, default false
@@ -173,7 +173,7 @@ The request body is a JSON object with the following fields:
 |-------|------|----------|---------|-------------|-------------|
 | `keyword` | string | **Yes** | -- | 1-700 characters. Must not be empty or whitespace-only. `%` must be encoded as `%25`, `+` as `%2B` in the keyword value if literal characters are intended. | The Google search query to execute. Supports Google search operators (`site:`, `intitle:`, etc.) but note that operators multiply DataForSEO cost by 5x. |
 | `location` | string or integer | **Yes** | -- | String: valid location name (e.g., `"United States"`, `"London,England,United Kingdom"`). Integer: valid DataForSEO location code (e.g., `2840` for US, `2826` for UK). | The geographic location for the search. The Worker auto-detects whether the value is a name (string) or code (integer) and maps to `location_name` or `location_code` in the DataForSEO request. |
-| `depth` | integer | No | `10` | Range: 1-700. Charged per 10 results by DataForSEO. | Number of SERP results to retrieve. |
+| `depth` | integer | No | `10` | Range: 1-200 (DataForSEO's documented maximum). Charged per 10 results by DataForSEO. | Number of SERP results to retrieve. |
 | `device` | string | No | `"desktop"` | Enum: `"desktop"`, `"mobile"`. Case-insensitive (normalized to lowercase). | Device type to emulate for the search. |
 | `language` | string | No | `"en"` | Valid DataForSEO language code (e.g., `"en"`, `"es"`, `"fr"`, `"de"`, `"ja"`). | Language code for the search results. Mapped to `language_code` in the DataForSEO request. |
 | `ai_optimized` | boolean | No | `false` | Must be a JSON boolean (`true` or `false`). Strings like `"true"`, integers like `1`, and `null` are **not** accepted — they return `400` with code `invalid_ai_optimized`. | When `true`, the Worker calls the `.ai` suffixed endpoint (`/live/advanced.ai`) which returns a flattened, token-efficient response format with null/false/empty fields stripped. When `false`, calls the standard endpoint (`/live/advanced`). |
@@ -401,7 +401,7 @@ All error responses follow a consistent JSON schema:
 | 400 | `invalid_keyword` | `keyword` exceeds 700 characters |
 | 400 | `missing_location` | `location` field is absent |
 | 400 | `invalid_location` | `location` is neither a valid string nor integer |
-| 400 | `invalid_depth` | `depth` is not an integer in range 1-700 |
+| 400 | `invalid_depth` | `depth` is not an integer in range 1-200 |
 | 400 | `invalid_device` | `device` is not `"desktop"` or `"mobile"` |
 | 400 | `invalid_language` | `language` is empty or not a string |
 | 400 | `invalid_ai_optimized` | `ai_optimized` is present but is not a JSON boolean (`true`/`false`) |
@@ -410,7 +410,7 @@ All error responses follow a consistent JSON schema:
 | 405 | `method_not_allowed` | Non-POST method on `/v1/serp`, non-GET/HEAD on `/v1/health` |
 | 500 | `missing_config` | `CSVKEY`, `DATAFORSEO_LOGIN`, or `DATAFORSEO_PASSWORD` secret is not configured |
 | 502 | `dataforseo_error` | DataForSEO returned an HTTP error (non-2xx status), **or** the outbound fetch to DataForSEO failed entirely (network error, DNS failure, TLS error). When the fetch never reached DataForSEO, the response will have `"dataforseo_status": 0` — this tells the caller the failure was at the network level, not a DataForSEO HTTP error. |
-| 504 | `dataforseo_timeout` | The Worker's outbound fetch to DataForSEO did not complete within the Worker's wall-clock limit. **Important implementation note:** Cloudflare Workers do not support `tokio::time::timeout` or similar async timeouts. Instead, when the Worker exceeds Cloudflare's wall-clock limit (30 seconds on free plan, configurable on paid plans), Cloudflare kills the Worker process. The Worker **cannot** catch this and return a structured `504` response. Therefore, this error code is **only** produced when the Worker can detect a timeout itself — specifically, when the `Fetch` call returns an error whose message contains "timeout" or "timed out". In practice, most timeouts will surface to the caller as Cloudflare's generic `524` (a timeout occurred) or a connection reset, **not** as this structured `504` JSON. Agents should handle both: (a) a structured `504` JSON response with code `dataforseo_timeout`, and (b) a non-JSON `524` or connection error from Cloudflare. |
+| 504 | `dataforseo_timeout` | The outbound fetch to DataForSEO failed with an error whose message contains "timeout" or "timed out". **Important implementation note:** Cloudflare Workers do not support `tokio::time::timeout` or similar async timeouts, and Cloudflare sets no time limit on the fetch while the caller stays connected. This code therefore only appears if the runtime itself reports a timeout, which should be rare. If the caller's own timeout fires first, the caller gets no response at all (see Section 4.6). |
 
 #### 3.4.4 DataForSEO Error Response
 
@@ -511,21 +511,22 @@ The Worker does not parse, validate, or transform the DataForSEO response body. 
 
 ### 4.6 Timeout Handling
 
-DataForSEO's Live mode has a 120-second timeout per task. Because the Worker always sets `resolve_goto_urls: true`, DataForSEO's total turnaround can reach 260 seconds. The Worker does not impose its own timeout — it relies on:
+DataForSEO's Live mode has a 120-second timeout per task. Because the Worker always sets `resolve_goto_urls: true`, DataForSEO's docs allow a total turnaround of up to 260 seconds. The Worker does not impose its own timeout. It relies on:
 1. DataForSEO's internal 120-second task timeout (status code `50401`)
-2. Cloudflare Workers' 30-second wall-clock limit on the free plan, or configurable limit on paid plans
+2. The caller staying connected. Cloudflare sets no duration limit on HTTP-triggered Workers and no time limit on individual subrequests while the client remains connected, and time spent waiting on DataForSEO does not count toward the Worker's CPU time limit. If the caller disconnects first, Cloudflare may cancel the Worker and the DataForSEO response is lost.
 
 **What actually happens in each scenario:**
 
 | Scenario | What the caller sees |
 |----------|---------------------|
-| DataForSEO responds within Cloudflare's wall-clock limit | Normal `200` response with DataForSEO's JSON body. If DataForSEO itself timed out, the JSON body will have `status_code: 50401` — the Worker still returns HTTP `200` (pass-through). |
-| The `Fetch` call errors with a message containing "timeout" or "timed out" | The Worker returns a structured `504` JSON response with code `dataforseo_timeout`. This is rare — it requires the `Fetch` API itself to report a timeout error before Cloudflare kills the Worker. |
-| Cloudflare's wall-clock limit is exceeded before the fetch completes | Cloudflare **kills the Worker process**. The Worker cannot catch this. The caller receives Cloudflare's generic `524 A Timeout Occurred` HTML error page — **not** a structured JSON response. There is no way to produce a JSON `504` in this case. |
+| DataForSEO responds while the caller is still connected | Normal `200` response with DataForSEO's JSON body. If DataForSEO itself timed out, the JSON body will have `status_code: 50401` — the Worker still returns HTTP `200` (pass-through). |
+| The `Fetch` call errors with a message containing "timeout" or "timed out" | The Worker returns a structured `504` JSON response with code `dataforseo_timeout`. This depends on the runtime's error text and should be rare. |
+| The caller's own timeout fires before DataForSEO responds | The caller gets nothing from rusty-serp; its HTTP client reports a timeout. The result is lost. |
+| The Worker throws an exception or the connection drops | A non-JSON Cloudflare error page or a connection reset, **not** a structured JSON response. |
 
-**Implication for agents:** Agents calling rusty-serp should handle three timeout scenarios: (1) a `200` with `status_code: 50401` in the body (DataForSEO timeout), (2) a `504` JSON with code `dataforseo_timeout` (rare, fetch-level timeout), and (3) a non-JSON `524` or connection reset (Cloudflare killed the Worker). Set agent tool timeout to at least 260 seconds (300 recommended).
+**Implication for agents:** Agents calling rusty-serp should handle four outcomes: (1) a `200` with `status_code: 50401` in the body (DataForSEO timeout), (2) a `504` JSON with code `dataforseo_timeout` (rare, fetch-level timeout), (3) their own client timeout, and (4) a non-JSON error page or connection reset. Set agent tool timeout to at least 260 seconds (300 recommended).
 
-**Implication for deployment:** If you are on the Cloudflare free plan (30-second limit), most DataForSEO queries will complete in time. But deep queries (`depth > 100`) or complex operator queries may exceed 30 seconds. Use a paid plan with Unbound (no CPU time limit) or Standard (30-second default, configurable) if you need to support long-running queries.
+**Implication for deployment:** Request duration does not depend on the Workers plan: waiting on DataForSEO is not CPU time, and Cloudflare does not limit how long an HTTP request may run while the caller stays connected.
 
 ### 4.7 Cost Implications
 
@@ -729,6 +730,9 @@ pub fn validate_auth(url: &Url, env: &Env) -> std::result::Result<(), Response>
 /// Returns Err(Response) on empty body, invalid JSON, or field validation failures.
 pub async fn parse_and_validate_body(req: &mut Request) -> std::result::Result<SerpRequest, Response>
 
+/// Parse and validate the body text. Split out so tests can call it without a Request.
+fn validate_body(body_text: &str) -> std::result::Result<SerpRequest, Response>
+
 /// Read a secret from the environment. Returns Err(Response) with 500 if not configured.
 pub fn read_secret(env: &Env, name: &str) -> std::result::Result<String, Response>
 
@@ -742,7 +746,7 @@ fn constant_time_eq(a: &[u8], b: &[u8]) -> bool
 |-------|-----------|-------|
 | `keyword` | Must be present. Must be a string. Must not be empty/whitespace after trim. Must be <= 700 chars. | `missing_keyword` or `invalid_keyword` |
 | `location` | Must be present. If JSON number, treat as location code (must be positive integer). If JSON string, treat as location name (must not be empty). A string like `"2840"` is treated as a location **name**, not a code — the Worker does not parse strings as integers. Any other JSON type (boolean, null, array, object) is rejected. | `missing_location` or `invalid_location` |
-| `depth` | If present, must be integer in range 1-700. | `invalid_depth` |
+| `depth` | If present, must be integer in range 1-200. | `invalid_depth` |
 | `device` | If present, must be `"desktop"` or `"mobile"` (case-insensitive). | `invalid_device` |
 | `language` | If present, must be a non-empty string. | `invalid_language` |
 | `ai_optimized` | If present, must be a JSON boolean (`true` or `false`). Strings, integers, null, and other types are **rejected** — not silently coerced. | `invalid_ai_optimized` |
@@ -773,7 +777,8 @@ pub async fn parse_and_validate_body(req: &mut Request) -> std::result::Result<S
         .filter(|s| !s.is_empty())
         .ok_or_else(|| json_error(400, "Missing or empty 'keyword' field", "missing_keyword").unwrap())?;
 
-    if keyword.len() > 700 {
+    // Count characters, not UTF-8 bytes: `len()` would reject non-Latin keywords early.
+    if keyword.chars().count() > 700 {
         return Err(json_error(400, "Keyword exceeds 700 character limit", "invalid_keyword").unwrap());
     }
 
@@ -800,8 +805,8 @@ pub async fn parse_and_validate_body(req: &mut Request) -> std::result::Result<S
         Some(v) => {
             let d = v.as_u64()
                 .and_then(|d| u32::try_from(d).ok())
-                .filter(|&d| d >= 1 && d <= 700)
-                .ok_or_else(|| json_error(400, "Depth must be an integer between 1 and 700", "invalid_depth").unwrap())?;
+                .filter(|&d| (1..=200).contains(&d))
+                .ok_or_else(|| json_error(400, "Depth must be an integer between 1 and 200", "invalid_depth").unwrap())?;
             d
         }
         None => 10,
@@ -938,8 +943,8 @@ pub async fn fetch_serp(
     //
     // If the error message contains "timeout" or "timed out", we return a 504
     // with code "dataforseo_timeout" instead. This is the only case where the
-    // Worker can produce a structured 504 — most real timeouts will be killed
-    // by Cloudflare's wall-clock limit before this code runs.
+    // Worker can produce a structured 504. Cloudflare sets no time limit on the
+    // fetch, so this only happens if the runtime reports a timeout itself.
     let mut response = Fetch::Request(outbound).send().await
         .map_err(|e| {
             let err_msg = format!("Fetch failed: {}", e);
@@ -1073,7 +1078,7 @@ fn truncate(s: &str, max_bytes: usize) -> &str {
 - Keyword length is capped at 700 characters (DataForSEO's limit).
 - Location values are type-checked (integer or non-empty string).
 - Device is validated against a whitelist (`desktop`, `mobile`).
-- Depth is range-checked (1-700).
+- Depth is range-checked (1-200).
 - No SQL, no database, no file system access — pure request proxy.
 
 ### 7.4 Known Limitations
@@ -1284,7 +1289,7 @@ from pydantic import BaseModel, Field
 class SerpInput(BaseModel):
     keyword: str = Field(description="The Google search query to execute")
     location: int | str = Field(description="DataForSEO location code (int) or name (str)")
-    depth: int = Field(default=10, description="Number of results to retrieve (1-700)")
+    depth: int = Field(default=10, description="Number of results to retrieve (1-200)")
     device: str = Field(default="desktop", description="Device type: 'desktop' or 'mobile'")
     language: str = Field(default="en", description="Language code for search results")
     ai_optimized: bool = Field(default=False, description="Use AI-optimized response format")
@@ -1340,7 +1345,7 @@ serp_tool = Tool(
 3. **Set `depth` conservatively**. Start with `10` (default). Only increase if the agent explicitly needs more results. Each additional 10 results adds ~$0.002.
 4. **Handle DataForSEO task-level errors**. A `200` HTTP response does not guarantee SERP success. Always check the `status_code` field in the response body (should be `20000` for success).
 5. **Set appropriate timeouts**. The Worker always turns on redirect resolution (`resolve_goto_urls`), so DataForSEO Live mode can take up to 260 seconds. Agent tool timeout should be at least 260 seconds (300 recommended).
-6. **Handle non-JSON timeout responses**. If Cloudflare's wall-clock limit kills the Worker, the agent receives a `524` HTML error page or a connection reset — not a JSON response. Agents must handle this gracefully (see Section 4.6 for details).
+6. **Handle non-JSON error responses**. If the Worker throws an exception or the connection drops, the agent receives a Cloudflare HTML error page or a connection reset, not a JSON response. Agents must handle this gracefully (see Section 4.6 for details).
 7. **Send `ai_optimized` as a JSON boolean**, not a string. `"ai_optimized": true` is correct. `"ai_optimized": "true"` returns a `400` error.
 
 ---

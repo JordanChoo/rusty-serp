@@ -50,11 +50,20 @@ pub async fn parse_and_validate_body(
         .unwrap()
     })?;
 
+    validate_body(&body_text)
+}
+
+/// Parses and validates the request body text.
+///
+/// Separate from reading the body so tests can call it without a `Request`.
+/// Error paths build a `worker::Response`, which needs the Workers runtime, so
+/// native tests can only check inputs that pass.
+fn validate_body(body_text: &str) -> std::result::Result<SerpRequest, Response> {
     if body_text.trim().is_empty() {
         return Err(json_error(400, "Request body is empty", "missing_body").unwrap());
     }
 
-    let body: serde_json::Value = serde_json::from_str(&body_text)
+    let body: serde_json::Value = serde_json::from_str(body_text)
         .map_err(|_| json_error(400, "Invalid JSON in request body", "invalid_json").unwrap())?;
 
     let keyword = body
@@ -66,7 +75,8 @@ pub async fn parse_and_validate_body(
             json_error(400, "Missing or empty 'keyword' field", "missing_keyword").unwrap()
         })?;
 
-    if keyword.len() > 700 {
+    // DataForSEO's limit is 700 characters; `len()` would count UTF-8 bytes.
+    if keyword.chars().count() > 700 {
         return Err(json_error(
             400,
             "Keyword exceeds 700 character limit",
@@ -111,11 +121,12 @@ pub async fn parse_and_validate_body(
         Some(v) => v
             .as_u64()
             .and_then(|d| u32::try_from(d).ok())
-            .filter(|&d| (1..=700).contains(&d))
+            // DataForSEO's documented maximum for live/advanced is 200.
+            .filter(|&d| (1..=200).contains(&d))
             .ok_or_else(|| {
                 json_error(
                     400,
-                    "Depth must be an integer between 1 and 700",
+                    "Depth must be an integer between 1 and 200",
                     "invalid_depth",
                 )
                 .unwrap()
@@ -191,4 +202,27 @@ fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
         .zip(b.iter())
         .fold(0u8, |acc, (x, y)| acc | (x ^ y))
         == 0
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn upper_limits_are_accepted() {
+        // 700 three-byte characters: 2,100 bytes, but exactly at the
+        // 700-character keyword limit.
+        let body = serde_json::json!({
+            "keyword": "日".repeat(700),
+            "location": 2392,
+            "depth": 200,
+        });
+
+        let Ok(request) = validate_body(&body.to_string()) else {
+            panic!("a 700-character keyword and depth 200 must be accepted");
+        };
+
+        assert_eq!(request.keyword.chars().count(), 700);
+        assert_eq!(request.depth, 200);
+    }
 }

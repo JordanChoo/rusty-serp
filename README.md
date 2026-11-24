@@ -132,7 +132,7 @@ curl -X POST "https://rusty-serp.example.com/v1/serp?csvkey=your-secret-key" \
 |-------|------|----------|---------|-------------|
 | `keyword` | string | Yes | — | Google search query (1-700 chars). Supports operators (`site:`, `intitle:`, etc.) but note 5x cost multiplier. |
 | `location` | string or int | Yes | — | DataForSEO location code (e.g., `2840` for US) or name (e.g., `"United States"`). |
-| `depth` | integer | No | `10` | Number of results to retrieve (1-700). Charged per 10 by DataForSEO. |
+| `depth` | integer | No | `10` | Number of results to retrieve (1-200). Charged per 10 by DataForSEO. |
 | `device` | string | No | `"desktop"` | `"desktop"` or `"mobile"` (case-insensitive). |
 | `language` | string | No | `"en"` | Language code (e.g., `"en"`, `"es"`, `"fr"`, `"de"`). |
 | `ai_optimized` | boolean | No | `false` | When `true`, calls the `.ai` endpoint for a flattened, token-efficient response. Must be a JSON boolean; strings like `"true"` are rejected. |
@@ -163,7 +163,7 @@ All errors return a consistent JSON shape:
 | 400 | `invalid_keyword` | `keyword` exceeds 700 characters |
 | 400 | `missing_location` | `location` field absent or invalid type |
 | 400 | `invalid_location` | `location` is not a valid string/integer |
-| 400 | `invalid_depth` | `depth` not an integer in range 1-700 |
+| 400 | `invalid_depth` | `depth` not an integer in range 1-200 |
 | 400 | `invalid_device` | `device` not `"desktop"` or `"mobile"` |
 | 400 | `invalid_language` | `language` is empty or not a string |
 | 400 | `invalid_ai_optimized` | `ai_optimized` present but not a boolean |
@@ -198,7 +198,7 @@ from pydantic import BaseModel, Field
 class SerpInput(BaseModel):
     keyword: str = Field(description="The Google search query to execute")
     location: int | str = Field(description="DataForSEO location code (int) or name (str)")
-    depth: int = Field(default=10, description="Number of results (1-700)")
+    depth: int = Field(default=10, description="Number of results (1-200)")
     device: str = Field(default="desktop", description="'desktop' or 'mobile'")
     language: str = Field(default="en", description="Language code")
     ai_optimized: bool = Field(default=False, description="Use AI-optimized response format")
@@ -250,7 +250,7 @@ serp_tool = Tool(
 - **Set `depth` conservatively.** Start with `10` (default). Each additional 10 results adds ~$0.002.
 - **Check `status_code` in the response body.** A `200` HTTP response does not guarantee SERP success; look for `20000` in the JSON.
 - **Set agent tool timeout to 300 seconds.** Redirect resolution is always on, so DataForSEO can take up to 260 seconds to respond.
-- **Handle non-JSON timeouts.** If Cloudflare's wall-clock limit kills the Worker, agents receive a `524` HTML error page or connection reset, not a JSON response.
+- **Handle non-JSON errors.** If the Worker throws an exception or the connection drops, agents receive a Cloudflare HTML error page or a connection reset, not a JSON response.
 
 ## Common Location Codes
 
