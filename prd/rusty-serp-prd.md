@@ -474,7 +474,7 @@ The Worker constructs the DataForSEO request body as a JSON array containing a s
 | `device` | `request.device` (default: `"desktop"`) | Normalized to lowercase |
 | `language_code` | `request.language` (default: `"en"`) | Passed through |
 | `load_async_ai_overview` | **Always `true`** | Hardcoded. Never overridden by caller input. |
-| `resolve_goto_urls` | **Always `true`** | Hardcoded. Never overridden by caller input. DataForSEO replaces Google redirect ("goto") links in `url` fields with final destination URLs and returns unresolvable links unchanged. Adds turnaround time; a request can take up to 260 seconds. |
+| `resolve_goto_urls` | **Always `true`** | Hardcoded. Never overridden by caller input. DataForSEO replaces Google redirect ("goto") links in the results with final destination URLs and returns unresolvable links unchanged. In testing, that covered both `url` fields and links inside `markdown` text. Adds turnaround time; a request can take up to 260 seconds. |
 
 **Example outbound request body:**
 

@@ -141,7 +141,7 @@ curl -X POST "https://rusty-serp.example.com/v1/serp?csvkey=your-secret-key" \
 
 **Response:** `200 OK` with DataForSEO response body passed through verbatim. The HTTP status is always `200` for successful upstream calls; check the `status_code` field in the JSON body for DataForSEO-level success or failure (`20000` = success).
 
-**Result URLs:** rusty-serp always sends `resolve_goto_urls: true`, so DataForSEO replaces Google's redirect ("goto") links in `url` fields with the final destination URLs. A redirect DataForSEO cannot resolve is returned unchanged. Callers cannot turn this off. It makes requests slower: DataForSEO can take up to 260 seconds to respond.
+**Result URLs:** rusty-serp always sends `resolve_goto_urls: true`, so DataForSEO replaces Google's redirect ("goto") links in the results with the final destination URLs. In testing, that covered both `url` fields and links inside `markdown` text. A redirect DataForSEO cannot resolve is returned unchanged. Callers cannot turn this off. It makes requests slower: DataForSEO can take up to 260 seconds to respond.
 
 ### Error Responses
 

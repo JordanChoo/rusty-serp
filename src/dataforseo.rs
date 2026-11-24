@@ -12,9 +12,10 @@ const DATAFORSEO_AI_URL: &str =
 /// Two flags are always on. `SerpRequest` has no field for either, so callers
 /// cannot turn them off:
 /// - `load_async_ai_overview` fetches AI Overviews that Google loads late.
-/// - `resolve_goto_urls` makes DataForSEO replace Google redirect links in `url`
-///   fields with the final destination URLs. Requests get slower: DataForSEO
-///   can take up to 260 seconds in total.
+/// - `resolve_goto_urls` makes DataForSEO replace Google redirect links in the
+///   results with the final destination URLs (in testing, both `url` fields and
+///   links inside `markdown` text). Requests get slower: DataForSEO can take up
+///   to 260 seconds in total.
 fn build_payload(request: &SerpRequest) -> serde_json::Value {
     let mut task = serde_json::json!({
         "keyword": request.keyword,
