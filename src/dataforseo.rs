@@ -9,13 +9,17 @@ const DATAFORSEO_AI_URL: &str =
 
 /// Builds the DataForSEO request body: an array holding one task.
 ///
-/// Two flags are always on. `SerpRequest` has no field for either, so callers
-/// cannot turn them off:
+/// Three flags are always on. `SerpRequest` has no field for any of them, so
+/// callers cannot turn them off:
 /// - `load_async_ai_overview` fetches AI Overviews that Google loads late.
 /// - `resolve_goto_urls` makes DataForSEO replace Google redirect links in the
 ///   results with the final destination URLs (in testing, both `url` fields and
 ///   links inside `markdown` text). Requests get slower: DataForSEO can take up
 ///   to 260 seconds in total.
+/// - `resolve_poisoned_results` makes DataForSEO check the organic results
+///   against Google's Web view and replace poisoned listings with verified
+///   ones, marked `from_web` in their `checks` array. It adds the price of one
+///   SERP page to every task, whether or not anything was poisoned.
 fn build_payload(request: &SerpRequest) -> serde_json::Value {
     let mut task = serde_json::json!({
         "keyword": request.keyword,
@@ -24,6 +28,7 @@ fn build_payload(request: &SerpRequest) -> serde_json::Value {
         "language_code": request.language,
         "load_async_ai_overview": true,
         "resolve_goto_urls": true,
+        "resolve_poisoned_results": true,
     });
 
     match &request.location {
@@ -128,6 +133,7 @@ mod tests {
                 assert_eq!(tasks.len(), 1);
                 assert_eq!(tasks[0]["resolve_goto_urls"], true);
                 assert_eq!(tasks[0]["load_async_ai_overview"], true);
+                assert_eq!(tasks[0]["resolve_poisoned_results"], true);
             }
         }
     }

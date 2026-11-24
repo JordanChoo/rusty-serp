@@ -30,6 +30,7 @@ Adapted from the architecture patterns established in [rusty-gateway](https://gi
 - Route to standard or AI-optimized (`.ai`) endpoint based on `ai_optimized` flag
 - Always set `load_async_ai_overview: true` in outbound requests
 - Always set `resolve_goto_urls: true` in outbound requests
+- Always set `resolve_poisoned_results: true` in outbound requests
 - Return DataForSEO responses verbatim
 - Health check endpoint
 
@@ -88,7 +89,7 @@ Adapted from the architecture patterns established in [rusty-gateway](https://gi
    - language: optional, non-empty string, default "en"
    - ai_optimized: optional, must be boolean if present, default false
 9. Worker reads DATAFORSEO_LOGIN and DATAFORSEO_PASSWORD from environment (reject missing with 500)
-10. Worker constructs DataForSEO request body (always sets load_async_ai_overview: true and resolve_goto_urls: true)
+10. Worker constructs DataForSEO request body (always sets load_async_ai_overview: true, resolve_goto_urls: true and resolve_poisoned_results: true)
 11. Worker determines endpoint URL:
     - ai_optimized == true  -> .../live/advanced.ai
     - ai_optimized == false -> .../live/advanced
@@ -121,7 +122,7 @@ rusty-serp/
 |--------|---------------|-------------|
 | `lib.rs` | `#[event(fetch)]` entry point, HTTP method check, orchestrates validation -> dataforseo call chain | `validation`, `dataforseo`, `errors` |
 | `validation.rs` | Parses `csvkey` from query params, reads and validates JSON body, performs constant-time auth comparison, validates all input fields | `errors` |
-| `dataforseo.rs` | Constructs DataForSEO request body (always setting `load_async_ai_overview: true`), builds Basic Auth header, selects endpoint URL, executes fetch, handles HTTP-level errors | `errors` |
+| `dataforseo.rs` | Constructs DataForSEO request body (always setting `load_async_ai_overview`, `resolve_goto_urls` and `resolve_poisoned_results` to `true`), builds Basic Auth header, selects endpoint URL, executes fetch, handles HTTP-level errors | `errors` |
 | `errors.rs` | Provides `json_error()` and `dataforseo_error()` response builder functions, UTF-8-safe body truncation | (none) |
 
 ---
@@ -257,8 +258,8 @@ The Worker returns the DataForSEO response body verbatim. The response shape dep
   "version": "0.1.20250520",
   "status_code": 20000,
   "status_message": "Ok.",
-  "time": "1.2345 sec.",
-  "cost": 0.004,
+  "time": "112.4521 sec.",
+  "cost": 0.008,
   "tasks_count": 1,
   "tasks_error": 0,
   "tasks": [
@@ -266,8 +267,8 @@ The Worker returns the DataForSEO response body verbatim. The response shape dep
       "id": "05281810-1535-0121-0000-014aadae6b3a",
       "status_code": 20000,
       "status_message": "Ok.",
-      "time": "1.1234 sec.",
-      "cost": 0.004,
+      "time": "112.3810 sec.",
+      "cost": 0.008,
       "result_count": 1,
       "path": ["v3", "serp", "google", "organic", "live", "advanced"],
       "data": {
@@ -280,7 +281,9 @@ The Worker returns the DataForSEO response body verbatim. The response shape dep
         "language_code": "en",
         "device": "desktop",
         "depth": 20,
-        "load_async_ai_overview": true
+        "load_async_ai_overview": true,
+        "resolve_goto_urls": true,
+        "resolve_poisoned_results": true
       },
       "result": [
         {
@@ -475,6 +478,7 @@ The Worker constructs the DataForSEO request body as a JSON array containing a s
 | `language_code` | `request.language` (default: `"en"`) | Passed through |
 | `load_async_ai_overview` | **Always `true`** | Hardcoded. Never overridden by caller input. |
 | `resolve_goto_urls` | **Always `true`** | Hardcoded. Never overridden by caller input. DataForSEO replaces Google redirect ("goto") links in the results with final destination URLs and returns unresolvable links unchanged. In testing, that covered both `url` fields and links inside `markdown` text. Adds turnaround time; a request can take up to 260 seconds. |
+| `resolve_poisoned_results` | **Always `true`** | Hardcoded. Never overridden by caller input. DataForSEO checks the first results page against Google's Web view. If the page looks poisoned (organic listings swapped for unrelated ones), it replaces the organic results with the verified ones, appends any extra Web-view listings, and marks each restored result with `from_web` in its `checks` array, in both response formats. Other SERP features are returned as collected. Adds the price of one SERP page to every task and one extra Google request to the turnaround time. Cannot be combined with `udm=web`/`udm=14`, which the Worker never sends. In testing (`"best running shoes"`, US), 9 of the 10 organic results came back marked `from_web`. |
 
 **Example outbound request body:**
 
@@ -487,7 +491,8 @@ The Worker constructs the DataForSEO request body as a JSON array containing a s
     "device": "desktop",
     "language_code": "en",
     "load_async_ai_overview": true,
-    "resolve_goto_urls": true
+    "resolve_goto_urls": true,
+    "resolve_poisoned_results": true
   }
 ]
 ```
@@ -511,7 +516,7 @@ The Worker does not parse, validate, or transform the DataForSEO response body. 
 
 ### 4.6 Timeout Handling
 
-DataForSEO's Live mode has a 120-second timeout per task. Because the Worker always sets `resolve_goto_urls: true`, DataForSEO's docs allow a total turnaround of up to 260 seconds. The Worker does not impose its own timeout. It relies on:
+DataForSEO's Live mode has a 120-second timeout per task. Because the Worker always sets `resolve_goto_urls: true`, DataForSEO's docs allow a total turnaround of up to 260 seconds. The Worker also always sets `resolve_poisoned_results: true`, which adds one Google request to every task; DataForSEO gives no time figure for it. In testing with both flags on, requests took 105 to 140 seconds. The Worker does not impose its own timeout. It relies on:
 1. DataForSEO's internal 120-second task timeout (status code `50401`)
 2. The caller staying connected. Cloudflare sets no duration limit on HTTP-triggered Workers and no time limit on individual subrequests while the client remains connected, and time spent waiting on DataForSEO does not count toward the Worker's CPU time limit. If the caller disconnects first, Cloudflare may cancel the Worker and the DataForSEO response is lost.
 
@@ -532,13 +537,14 @@ DataForSEO's Live mode has a 120-second timeout per task. Because the Worker alw
 
 | Scenario | DataForSEO Cost |
 |----------|----------------|
-| Basic query, 10 results | $0.002 (base) + $0.002 (`load_async_ai_overview`) = **$0.004** |
-| Basic query, 20 results | $0.004 (2 pages) + $0.002 = **$0.006** |
+| Basic query, 10 results | $0.002 (base) + $0.002 (`load_async_ai_overview`) + $0.002 (`resolve_poisoned_results`) = **$0.006** |
+| Basic query, 20 results | $0.004 (2 pages) + $0.002 + $0.002 = **$0.008** |
 | AI overview absent from SERP | `load_async_ai_overview` surcharge refunded |
 | AI overview was cached (not async) | `load_async_ai_overview` surcharge refunded |
 | Query with search operators | Base cost x5 |
 | `.ai` suffix (AI-optimized) | No additional cost |
 | `resolve_goto_urls` (always on) | No extra charge listed by DataForSEO |
+| `resolve_poisoned_results` (always on) | Price of one more SERP page ($0.002 for Live) per task, fixed regardless of depth and charged even when nothing was poisoned. In testing, a 10-result Live task cost $0.004 with it, against $0.002 without (the AI overview surcharge was refunded both times). |
 
 ---
 
@@ -906,6 +912,7 @@ pub async fn fetch_serp(
         "language_code": request.language,
         "load_async_ai_overview": true,
         "resolve_goto_urls": true,
+        "resolve_poisoned_results": true,
     });
 
     // 3. Set location field based on type
@@ -1348,7 +1355,7 @@ serp_tool = Tool(
 2. **Use `ai_optimized: false`** when the agent needs full metadata (rectangles, XPath, exact position data, cost breakdown).
 3. **Set `depth` conservatively**. Start with `10` (default). Only increase if the agent explicitly needs more results. Each additional 10 results adds ~$0.002.
 4. **Handle DataForSEO task-level errors**. A `200` HTTP response does not guarantee SERP success. Always check the `status_code` field in the response body (should be `20000` for success).
-5. **Set appropriate timeouts**. The Worker always turns on redirect resolution (`resolve_goto_urls`), so DataForSEO Live mode can take up to 260 seconds. Agent tool timeout should be at least 260 seconds (300 recommended).
+5. **Set appropriate timeouts**. The Worker always turns on redirect resolution (`resolve_goto_urls`), so DataForSEO Live mode can take up to 260 seconds, and the poisoned-result check (`resolve_poisoned_results`) adds one more Google request. Agent tool timeout should be at least 260 seconds (300 recommended).
 6. **Handle non-JSON error responses**. If the Worker throws an exception or the connection drops, the agent receives a Cloudflare HTML error page or a connection reset, not a JSON response. Agents must handle this gracefully (see Section 4.6 for details).
 7. **Send `ai_optimized` as a JSON boolean**, not a string. `"ai_optimized": true` is correct. `"ai_optimized": "true"` returns a `400` error.
 
