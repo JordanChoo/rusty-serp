@@ -291,6 +291,8 @@ curl -X POST "http://localhost:8787/v1/serp?csvkey=your-local-test-key" \
   -d '{"keyword": "rust programming", "location": 2840}'
 ```
 
+Use a current Wrangler (`npm install -g wrangler` updates it). The `worker` crate relies on the runtime's `tracing.getActiveSpan` and `tracing.withActiveSpan` for every request. Older Wrangler releases bundle a runtime without them, and then every request fails with HTTP 500 and `Uncaught Error: Critical error` in the log. Wrangler 4.167.0 works; 4.96.0 does not.
+
 ## Deployment
 
 ```bash

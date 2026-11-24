@@ -573,7 +573,7 @@ name = "rusty-serp"
 
 **Key design decisions:**
 - **Self-bootstrapping build command**: Installs Rust, the WASM target, and `worker-build` if not already present. Same pattern as rusty-gateway, except that `worker-build` is pinned.
-- **Pinned `worker-build`**: `--version 0.9.0 --locked` installs an exact release. `worker-build` rejects a `worker` crate from an older minor version, so an unpinned install broke the build when `worker-build` 0.9.0 came out. Bump it together with `worker` in `Cargo.toml`.
+- **Pinned `worker-build`**: `--version 0.9.0 --locked` installs an exact release. `worker-build` accepts only a `worker` crate of its own minor version, so once `worker-build` 0.9.0 came out, the unpinned install could no longer build this project on `worker` 0.8. The pin is exact rather than `^0.9` because a patch release can break the build too: `worker-build` 0.8.7 passes wasm-bindgen a flag that the CLI version locked here at the time (0.2.122) did not support. Bump it together with `worker` in `Cargo.toml`.
 - **No `[vars]` section**: All configuration is via secrets. No environment variables are needed for this Worker.
 - **Staging and production environments**: Allows separate secret sets for testing vs. production.
 - **Top-level `name` is `rusty-serp-dev`**: The top-level name is used for bare `wrangler deploy` (no `--env` flag) and local `wrangler dev`. It is intentionally different from the `[env.production]` name (`rusty-serp`) to prevent accidental production deployments. A bare `wrangler deploy` deploys to the `rusty-serp-dev` Worker, which is harmless. To deploy to production, you **must** explicitly pass `--env production`. If the top-level name were also `rusty-serp`, a bare `wrangler deploy` would overwrite the production Worker.
@@ -606,7 +606,7 @@ strip = true
 
 | Crate | Version | Why |
 |-------|---------|-----|
-| `worker` | `0.9` | Cloudflare Workers runtime bindings. Provides `Request`, `Response`, `Env`, `Fetch`, `Headers`, `Method`. Must match the minor version of the `worker-build` pinned in `wrangler.toml`. |
+| `worker` | `0.9` | Cloudflare Workers runtime bindings. Provides `Request`, `Response`, `Env`, `Fetch`, `Headers`, `Method`. Must match the minor version of the `worker-build` pinned in `wrangler.toml`. Runs every handler under the runtime's active trace span, so it needs a Workers runtime with `tracing.getActiveSpan` and `tracing.withActiveSpan` (the latter added November 2026); see Section 9.3 for what that means for `wrangler dev`. |
 | `serde` | `1` (derive) | Deserialize inbound JSON request body into typed struct. Serialize outbound DataForSEO request. |
 | `serde_json` | `1` | JSON parsing and construction. Used for request body deserialization and DataForSEO request body construction. |
 | `base64` | `0.22` | Encode `login:password` for DataForSEO Basic Auth header. |
@@ -1196,6 +1196,8 @@ DATAFORSEO_PASSWORD=your-dataforseo-api-password
 wrangler dev
 ```
 
+Use a current Wrangler (`npm install -g wrangler` updates it). `worker` 0.9 relies on the runtime's `tracing.getActiveSpan` and `tracing.withActiveSpan` for every request. Older Wrangler releases bundle a runtime without them, and then every request fails with HTTP 500 and `Uncaught Error: Critical error` in the log. Wrangler 4.167.0 works; 4.96.0 does not.
+
 This starts a local server (typically at `http://localhost:8787`). You can then test with:
 
 ```bash
@@ -1217,7 +1219,7 @@ curl -X POST "http://localhost:8787/v1/serp?csvkey=your-local-test-key" \
 git clone <repo-url>
 cd rusty-serp
 
-# 2. Install wrangler (if not already installed)
+# 2. Install wrangler, or update it: `wrangler dev` needs a current release (Section 9.3)
 npm install -g wrangler
 
 # 3. Authenticate with Cloudflare
