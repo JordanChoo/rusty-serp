@@ -1196,8 +1196,6 @@ DATAFORSEO_PASSWORD=your-dataforseo-api-password
 wrangler dev
 ```
 
-Use a current Wrangler (`npm install -g wrangler` updates it). `worker` 0.9 relies on the runtime's `tracing.getActiveSpan` and `tracing.withActiveSpan` for every request. Older Wrangler releases bundle a runtime without them, and then every request fails with HTTP 500 and `Uncaught Error: Critical error` in the log. Wrangler 4.167.0 works; 4.96.0 does not.
-
 This starts a local server (typically at `http://localhost:8787`). You can then test with:
 
 ```bash
@@ -1205,6 +1203,8 @@ curl -X POST "http://localhost:8787/v1/serp?csvkey=your-local-test-key" \
   -H "Content-Type: application/json" \
   -d '{"keyword": "test query", "location": 2840}'
 ```
+
+**Wrangler version:** Use a current Wrangler (`npm install -g wrangler` updates it). `worker` 0.9 relies on the runtime's `tracing.getActiveSpan` and `tracing.withActiveSpan` for every request. Older Wrangler releases bundle a runtime without them, and then every request fails with HTTP 500 and `Uncaught Error: Critical error` in the log. Wrangler 4.167.0 works; 4.96.0 does not.
 
 **Note:** `wrangler secret put` is only used for setting secrets on deployed environments (staging, production). See Section 10 for deployment instructions.
 
