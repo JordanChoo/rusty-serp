@@ -562,7 +562,7 @@ main = "build/worker/shim.mjs"
 compatibility_date = "2026-05-20"
 
 [build]
-command = "curl https://sh.rustup.rs -sSf | sh -s -- -y --default-toolchain stable && . \"$HOME/.cargo/env\" && rustup target add wasm32-unknown-unknown && cargo install -q worker-build && worker-build --release"
+command = "curl https://sh.rustup.rs -sSf | sh -s -- -y --default-toolchain stable && . \"$HOME/.cargo/env\" && rustup target add wasm32-unknown-unknown && cargo install -q worker-build --version 0.9.0 --locked && worker-build --release"
 
 [env.staging]
 name = "rusty-serp-staging"
@@ -572,7 +572,8 @@ name = "rusty-serp"
 ```
 
 **Key design decisions:**
-- **Self-bootstrapping build command**: Installs Rust, the WASM target, and `worker-build` if not already present. Identical pattern to rusty-gateway.
+- **Self-bootstrapping build command**: Installs Rust, the WASM target, and `worker-build` if not already present. Same pattern as rusty-gateway, except that `worker-build` is pinned.
+- **Pinned `worker-build`**: `--version 0.9.0 --locked` installs an exact release. `worker-build` rejects a `worker` crate from an older minor version, so an unpinned install broke the build when `worker-build` 0.9.0 came out. Bump it together with `worker` in `Cargo.toml`.
 - **No `[vars]` section**: All configuration is via secrets. No environment variables are needed for this Worker.
 - **Staging and production environments**: Allows separate secret sets for testing vs. production.
 - **Top-level `name` is `rusty-serp-dev`**: The top-level name is used for bare `wrangler deploy` (no `--env` flag) and local `wrangler dev`. It is intentionally different from the `[env.production]` name (`rusty-serp`) to prevent accidental production deployments. A bare `wrangler deploy` deploys to the `rusty-serp-dev` Worker, which is harmless. To deploy to production, you **must** explicitly pass `--env production`. If the top-level name were also `rusty-serp`, a bare `wrangler deploy` would overwrite the production Worker.
@@ -589,7 +590,7 @@ edition = "2021"
 crate-type = ["cdylib"]
 
 [dependencies]
-worker = "0.8"
+worker = "0.9"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 base64 = "0.22"
@@ -605,7 +606,7 @@ strip = true
 
 | Crate | Version | Why |
 |-------|---------|-----|
-| `worker` | `0.8` | Cloudflare Workers runtime bindings. Provides `Request`, `Response`, `Env`, `Fetch`, `Headers`, `Method`. Same version as rusty-gateway. |
+| `worker` | `0.9` | Cloudflare Workers runtime bindings. Provides `Request`, `Response`, `Env`, `Fetch`, `Headers`, `Method`. Must match the minor version of the `worker-build` pinned in `wrangler.toml`. |
 | `serde` | `1` (derive) | Deserialize inbound JSON request body into typed struct. Serialize outbound DataForSEO request. |
 | `serde_json` | `1` | JSON parsing and construction. Used for request body deserialization and DataForSEO request body construction. |
 | `base64` | `0.22` | Encode `login:password` for DataForSEO Basic Auth header. |

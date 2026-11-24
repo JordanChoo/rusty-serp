@@ -354,7 +354,7 @@ To roll back a deployment, navigate to **Workers & Pages > rusty-serp > Deployme
 
 | Crate | Version | Purpose |
 |-------|---------|---------|
-| `worker` | 0.8 | Cloudflare Workers runtime bindings |
+| `worker` | 0.9 | Cloudflare Workers runtime bindings |
 | `serde` | 1 | JSON deserialization with derive macros |
 | `serde_json` | 1 | JSON parsing and value construction |
 | `base64` | 0.22 | DataForSEO Basic Auth encoding |
