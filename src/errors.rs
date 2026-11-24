@@ -12,7 +12,11 @@ pub fn json_error(status: u16, error: &str, code: &str) -> Result<Response> {
     Ok(resp.with_status(status))
 }
 
-pub fn dataforseo_error(dfs_status: u16, dfs_body: &str, dfs_error_code: Option<&str>) -> Result<Response> {
+pub fn dataforseo_error(
+    dfs_status: u16,
+    dfs_body: &str,
+    dfs_error_code: Option<&str>,
+) -> Result<Response> {
     let mut payload = serde_json::json!({
         "error": "DataForSEO request failed",
         "code": "dataforseo_error",

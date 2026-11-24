@@ -37,7 +37,7 @@ rusty-serp centralizes all of this behind a single HTTP endpoint. Agents send a 
 1. Agent sends `POST /v1/serp?csvkey=<key>` with a JSON body
 2. Worker validates the csvkey via constant-time comparison
 3. Worker parses and validates the request body (keyword, location, depth, device, language, ai_optimized)
-4. Worker constructs the DataForSEO request with Basic Auth and always sets `load_async_ai_overview: true`
+4. Worker constructs the DataForSEO request with Basic Auth and always sets `load_async_ai_overview: true` and `resolve_goto_urls: true`
 5. Worker selects the standard or AI-optimized endpoint based on the `ai_optimized` flag
 6. Worker returns the DataForSEO response verbatim, without transformation or filtering
 
@@ -141,6 +141,8 @@ curl -X POST "https://rusty-serp.example.com/v1/serp?csvkey=your-secret-key" \
 
 **Response:** `200 OK` with DataForSEO response body passed through verbatim. The HTTP status is always `200` for successful upstream calls; check the `status_code` field in the JSON body for DataForSEO-level success or failure (`20000` = success).
 
+**Result URLs:** rusty-serp always sends `resolve_goto_urls: true`, so DataForSEO replaces Google's redirect ("goto") links in `url` fields with the final destination URLs. A redirect DataForSEO cannot resolve is returned unchanged. Callers cannot turn this off. It makes requests slower: DataForSEO can take up to 260 seconds to respond.
+
 ### Error Responses
 
 All errors return a consistent JSON shape:
@@ -213,7 +215,7 @@ def fetch_serp(keyword: str, location: int | str, depth: int = 10,
             "keyword": keyword, "location": location, "depth": depth,
             "device": device, "language": language, "ai_optimized": ai_optimized,
         },
-        timeout=120,
+        timeout=300,
     )
     response.raise_for_status()
     return response.json()
@@ -247,7 +249,7 @@ serp_tool = Tool(
 - **Use `ai_optimized: false`** when agents need full metadata (rectangles, XPath, position data, cost breakdown).
 - **Set `depth` conservatively.** Start with `10` (default). Each additional 10 results adds ~$0.002.
 - **Check `status_code` in the response body.** A `200` HTTP response does not guarantee SERP success; look for `20000` in the JSON.
-- **Set agent tool timeout to 120+ seconds.** DataForSEO Live mode can take up to 120 seconds for complex queries.
+- **Set agent tool timeout to 300 seconds.** Redirect resolution is always on, so DataForSEO can take up to 260 seconds to respond.
 - **Handle non-JSON timeouts.** If Cloudflare's wall-clock limit kills the Worker, agents receive a `524` HTML error page or connection reset, not a JSON response.
 
 ## Common Location Codes
@@ -346,6 +348,7 @@ To roll back a deployment, navigate to **Workers & Pages > rusty-serp > Deployme
 | AI overview absent/cached | AI overview surcharge refunded |
 | Query with search operators | Base cost x5 |
 | `.ai` endpoint (AI-optimized) | No additional cost |
+| Redirect resolution (`resolve_goto_urls`, always on) | No extra charge listed by DataForSEO |
 
 ## Dependencies
 

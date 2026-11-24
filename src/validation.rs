@@ -67,9 +67,12 @@ pub async fn parse_and_validate_body(
         })?;
 
     if keyword.len() > 700 {
-        return Err(
-            json_error(400, "Keyword exceeds 700 character limit", "invalid_keyword").unwrap(),
-        );
+        return Err(json_error(
+            400,
+            "Keyword exceeds 700 character limit",
+            "invalid_keyword",
+        )
+        .unwrap());
     }
 
     let location = match body.get("location") {
@@ -95,9 +98,12 @@ pub async fn parse_and_validate_body(
             Location::Name(trimmed)
         }
         _ => {
-            return Err(
-                json_error(400, "Missing or invalid 'location' field", "missing_location").unwrap(),
+            return Err(json_error(
+                400,
+                "Missing or invalid 'location' field",
+                "missing_location",
             )
+            .unwrap())
         }
     };
 
@@ -105,7 +111,7 @@ pub async fn parse_and_validate_body(
         Some(v) => v
             .as_u64()
             .and_then(|d| u32::try_from(d).ok())
-            .filter(|&d| d >= 1 && d <= 700)
+            .filter(|&d| (1..=700).contains(&d))
             .ok_or_else(|| {
                 json_error(
                     400,
@@ -123,7 +129,12 @@ pub async fn parse_and_validate_body(
             .map(|s| s.to_lowercase())
             .filter(|s| s == "desktop" || s == "mobile")
             .ok_or_else(|| {
-                json_error(400, "Device must be 'desktop' or 'mobile'", "invalid_device").unwrap()
+                json_error(
+                    400,
+                    "Device must be 'desktop' or 'mobile'",
+                    "invalid_device",
+                )
+                .unwrap()
             })?,
         None => "desktop".to_string(),
     };
@@ -134,7 +145,12 @@ pub async fn parse_and_validate_body(
             .map(|s| s.trim().to_string())
             .filter(|s| !s.is_empty())
             .ok_or_else(|| {
-                json_error(400, "Language must be a non-empty string", "invalid_language").unwrap()
+                json_error(
+                    400,
+                    "Language must be a non-empty string",
+                    "invalid_language",
+                )
+                .unwrap()
             })?,
         None => "en".to_string(),
     };
@@ -162,9 +178,9 @@ pub async fn parse_and_validate_body(
 }
 
 pub fn read_secret(env: &Env, name: &str) -> std::result::Result<String, Response> {
-    env.secret(name)
-        .map(|s| s.to_string())
-        .map_err(|_| json_error(500, &format!("{} not configured", name), "missing_config").unwrap())
+    env.secret(name).map(|s| s.to_string()).map_err(|_| {
+        json_error(500, &format!("{} not configured", name), "missing_config").unwrap()
+    })
 }
 
 fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {

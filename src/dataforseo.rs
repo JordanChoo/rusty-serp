@@ -1,12 +1,40 @@
-use base64::Engine;
 use crate::errors::{dataforseo_error, json_error};
 use crate::validation::{Location, SerpRequest};
+use base64::Engine;
 use worker::*;
 
-const DATAFORSEO_BASE_URL: &str =
-    "https://api.dataforseo.com/v3/serp/google/organic/live/advanced";
+const DATAFORSEO_BASE_URL: &str = "https://api.dataforseo.com/v3/serp/google/organic/live/advanced";
 const DATAFORSEO_AI_URL: &str =
     "https://api.dataforseo.com/v3/serp/google/organic/live/advanced.ai";
+
+/// Builds the DataForSEO request body: an array holding one task.
+///
+/// Two flags are always on. `SerpRequest` has no field for either, so callers
+/// cannot turn them off:
+/// - `load_async_ai_overview` fetches AI Overviews that Google loads late.
+/// - `resolve_goto_urls` replaces Google redirect links in `url` fields with
+///   the final destination URLs. It makes DataForSEO slower: up to 260 seconds.
+fn build_payload(request: &SerpRequest) -> serde_json::Value {
+    let mut task = serde_json::json!({
+        "keyword": request.keyword,
+        "depth": request.depth,
+        "device": request.device,
+        "language_code": request.language,
+        "load_async_ai_overview": true,
+        "resolve_goto_urls": true,
+    });
+
+    match &request.location {
+        Location::Code(code) => {
+            task["location_code"] = serde_json::json!(code);
+        }
+        Location::Name(name) => {
+            task["location_name"] = serde_json::json!(name);
+        }
+    }
+
+    serde_json::json!([task])
+}
 
 pub async fn fetch_serp(
     request: &SerpRequest,
@@ -19,45 +47,30 @@ pub async fn fetch_serp(
         DATAFORSEO_BASE_URL
     };
 
-    let mut task = serde_json::json!({
-        "keyword": request.keyword,
-        "depth": request.depth,
-        "device": request.device,
-        "language_code": request.language,
-        "load_async_ai_overview": true,
-    });
-
-    match &request.location {
-        Location::Code(code) => {
-            task["location_code"] = serde_json::json!(code);
-        }
-        Location::Name(name) => {
-            task["location_name"] = serde_json::json!(name);
-        }
-    }
-
-    let payload = serde_json::json!([task]);
+    let payload = build_payload(request);
 
     let credentials = format!("{}:{}", login, password);
-    let encoded =
-        base64::engine::general_purpose::STANDARD.encode(credentials.as_bytes());
+    let encoded = base64::engine::general_purpose::STANDARD.encode(credentials.as_bytes());
     let auth_header = format!("Basic {}", encoded);
 
     let headers = Headers::new();
-    headers
-        .set("Authorization", &auth_header)
-        .map_err(|_| json_error(500, "Failed to build request headers", "missing_config").unwrap())?;
+    headers.set("Authorization", &auth_header).map_err(|_| {
+        json_error(500, "Failed to build request headers", "missing_config").unwrap()
+    })?;
     headers
         .set("Content-Type", "application/json")
-        .map_err(|_| json_error(500, "Failed to build request headers", "missing_config").unwrap())?;
+        .map_err(|_| {
+            json_error(500, "Failed to build request headers", "missing_config").unwrap()
+        })?;
 
     let mut init = RequestInit::new();
     init.with_method(Method::Post)
         .with_headers(headers)
         .with_body(Some(payload.to_string().into()));
 
-    let outbound = Request::new_with_init(url, &init)
-        .map_err(|_| json_error(500, "Failed to build outbound request", "missing_config").unwrap())?;
+    let outbound = Request::new_with_init(url, &init).map_err(|_| {
+        json_error(500, "Failed to build outbound request", "missing_config").unwrap()
+    })?;
 
     let mut response = Fetch::Request(outbound).send().await.map_err(|e| {
         let err_msg = format!("Fetch failed: {}", e);
@@ -78,10 +91,42 @@ pub async fn fetch_serp(
         return Err(dataforseo_error(status, &body_text, None).unwrap());
     }
 
-    let mut resp =
-        Response::ok(body_text).map_err(|_| dataforseo_error(status, "Failed to construct response", None).unwrap())?;
+    let mut resp = Response::ok(body_text)
+        .map_err(|_| dataforseo_error(status, "Failed to construct response", None).unwrap())?;
     resp.headers_mut()
         .set("Content-Type", "application/json")
         .map_err(|_| dataforseo_error(status, "Failed to set response headers", None).unwrap())?;
     Ok(resp)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn request(location: Location, ai_optimized: bool) -> SerpRequest {
+        SerpRequest {
+            keyword: "rust programming".to_string(),
+            location,
+            depth: 10,
+            device: "desktop".to_string(),
+            language: "en".to_string(),
+            ai_optimized,
+        }
+    }
+
+    #[test]
+    fn always_on_flags_are_set_for_every_request_shape() {
+        for ai_optimized in [false, true] {
+            for location in [
+                Location::Code(2840),
+                Location::Name("United States".to_string()),
+            ] {
+                let payload = build_payload(&request(location, ai_optimized));
+                let tasks = payload.as_array().expect("payload must be an array");
+                assert_eq!(tasks.len(), 1);
+                assert_eq!(tasks[0]["resolve_goto_urls"], true);
+                assert_eq!(tasks[0]["load_async_ai_overview"], true);
+            }
+        }
+    }
 }

@@ -29,6 +29,7 @@ Adapted from the architecture patterns established in [rusty-gateway](https://gi
 - Construct and execute DataForSEO SERP API requests
 - Route to standard or AI-optimized (`.ai`) endpoint based on `ai_optimized` flag
 - Always set `load_async_ai_overview: true` in outbound requests
+- Always set `resolve_goto_urls: true` in outbound requests
 - Return DataForSEO responses verbatim
 - Health check endpoint
 
@@ -87,7 +88,7 @@ Adapted from the architecture patterns established in [rusty-gateway](https://gi
    - language: optional, non-empty string, default "en"
    - ai_optimized: optional, must be boolean if present, default false
 9. Worker reads DATAFORSEO_LOGIN and DATAFORSEO_PASSWORD from environment (reject missing with 500)
-10. Worker constructs DataForSEO request body (always sets load_async_ai_overview: true)
+10. Worker constructs DataForSEO request body (always sets load_async_ai_overview: true and resolve_goto_urls: true)
 11. Worker determines endpoint URL:
     - ai_optimized == true  -> .../live/advanced.ai
     - ai_optimized == false -> .../live/advanced
@@ -473,6 +474,7 @@ The Worker constructs the DataForSEO request body as a JSON array containing a s
 | `device` | `request.device` (default: `"desktop"`) | Normalized to lowercase |
 | `language_code` | `request.language` (default: `"en"`) | Passed through |
 | `load_async_ai_overview` | **Always `true`** | Hardcoded. Never overridden by caller input. |
+| `resolve_goto_urls` | **Always `true`** | Hardcoded. Never overridden by caller input. DataForSEO replaces Google redirect ("goto") links in `url` fields with final destination URLs and returns unresolvable links unchanged. Adds turnaround time; a request can take up to 260 seconds. |
 
 **Example outbound request body:**
 
@@ -484,7 +486,8 @@ The Worker constructs the DataForSEO request body as a JSON array containing a s
     "depth": 20,
     "device": "desktop",
     "language_code": "en",
-    "load_async_ai_overview": true
+    "load_async_ai_overview": true,
+    "resolve_goto_urls": true
   }
 ]
 ```
@@ -508,7 +511,7 @@ The Worker does not parse, validate, or transform the DataForSEO response body. 
 
 ### 4.6 Timeout Handling
 
-DataForSEO's Live mode has a 120-second timeout per task. The Worker does not impose its own timeout — it relies on:
+DataForSEO's Live mode has a 120-second timeout per task. Because the Worker always sets `resolve_goto_urls: true`, DataForSEO's total turnaround can reach 260 seconds. The Worker does not impose its own timeout — it relies on:
 1. DataForSEO's internal 120-second task timeout (status code `50401`)
 2. Cloudflare Workers' 30-second wall-clock limit on the free plan, or configurable limit on paid plans
 
@@ -520,7 +523,7 @@ DataForSEO's Live mode has a 120-second timeout per task. The Worker does not im
 | The `Fetch` call errors with a message containing "timeout" or "timed out" | The Worker returns a structured `504` JSON response with code `dataforseo_timeout`. This is rare — it requires the `Fetch` API itself to report a timeout error before Cloudflare kills the Worker. |
 | Cloudflare's wall-clock limit is exceeded before the fetch completes | Cloudflare **kills the Worker process**. The Worker cannot catch this. The caller receives Cloudflare's generic `524 A Timeout Occurred` HTML error page — **not** a structured JSON response. There is no way to produce a JSON `504` in this case. |
 
-**Implication for agents:** Agents calling rusty-serp should handle three timeout scenarios: (1) a `200` with `status_code: 50401` in the body (DataForSEO timeout), (2) a `504` JSON with code `dataforseo_timeout` (rare, fetch-level timeout), and (3) a non-JSON `524` or connection reset (Cloudflare killed the Worker). Set agent tool timeout to at least 120 seconds.
+**Implication for agents:** Agents calling rusty-serp should handle three timeout scenarios: (1) a `200` with `status_code: 50401` in the body (DataForSEO timeout), (2) a `504` JSON with code `dataforseo_timeout` (rare, fetch-level timeout), and (3) a non-JSON `524` or connection reset (Cloudflare killed the Worker). Set agent tool timeout to at least 260 seconds (300 recommended).
 
 **Implication for deployment:** If you are on the Cloudflare free plan (30-second limit), most DataForSEO queries will complete in time. But deep queries (`depth > 100`) or complex operator queries may exceed 30 seconds. Use a paid plan with Unbound (no CPU time limit) or Standard (30-second default, configurable) if you need to support long-running queries.
 
@@ -534,6 +537,7 @@ DataForSEO's Live mode has a 120-second timeout per task. The Worker does not im
 | AI overview was cached (not async) | `load_async_ai_overview` surcharge refunded |
 | Query with search operators | Base cost x5 |
 | `.ai` suffix (AI-optimized) | No additional cost |
+| `resolve_goto_urls` (always on) | No extra charge listed by DataForSEO |
 
 ---
 
@@ -894,6 +898,7 @@ pub async fn fetch_serp(
         "device": request.device,
         "language_code": request.language,
         "load_async_ai_overview": true,
+        "resolve_goto_urls": true,
     });
 
     // 3. Set location field based on type
@@ -1300,7 +1305,7 @@ def fetch_serp(keyword: str, location: int | str, depth: int = 10,
             "language": language,
             "ai_optimized": ai_optimized,
         },
-        timeout=120,
+        timeout=300,
     )
     response.raise_for_status()
     return response.json()
@@ -1334,7 +1339,7 @@ serp_tool = Tool(
 2. **Use `ai_optimized: false`** when the agent needs full metadata (rectangles, XPath, exact position data, cost breakdown).
 3. **Set `depth` conservatively**. Start with `10` (default). Only increase if the agent explicitly needs more results. Each additional 10 results adds ~$0.002.
 4. **Handle DataForSEO task-level errors**. A `200` HTTP response does not guarantee SERP success. Always check the `status_code` field in the response body (should be `20000` for success).
-5. **Set appropriate timeouts**. DataForSEO Live mode can take up to 120 seconds. Agent tool timeout should be at least 120 seconds.
+5. **Set appropriate timeouts**. The Worker always turns on redirect resolution (`resolve_goto_urls`), so DataForSEO Live mode can take up to 260 seconds. Agent tool timeout should be at least 260 seconds (300 recommended).
 6. **Handle non-JSON timeout responses**. If Cloudflare's wall-clock limit kills the Worker, the agent receives a `524` HTML error page or a connection reset — not a JSON response. Agents must handle this gracefully (see Section 4.6 for details).
 7. **Send `ai_optimized` as a JSON boolean**, not a string. `"ai_optimized": true` is correct. `"ai_optimized": "true"` returns a `400` error.
 
