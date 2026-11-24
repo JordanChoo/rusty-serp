@@ -297,24 +297,26 @@ Use a current Wrangler (`npm install -g wrangler` updates it). The `worker` crat
 
 ## Deployment
 
+Production deploys automatically. The repository is connected to the `rusty-serp` Worker through Cloudflare Workers Builds, so every push to `main` builds the Worker with the `[build]` command in `wrangler.toml` and deploys it to production. The result shows up as the **Workers Builds: rusty-serp** check on the commit in GitHub.
+
+The top-level `name` in `wrangler.toml` is `rusty-serp`, the production Worker, because Workers Builds fails the build unless it matches the connected Worker. So a bare `wrangler deploy` from your machine deploys to **production** too. Use `--env staging` for anything that must not reach production.
+
 ```bash
-# Set secrets (once per environment, entered interactively)
-wrangler secret put CSVKEY --env production
-wrangler secret put DATAFORSEO_LOGIN --env production
-wrangler secret put DATAFORSEO_PASSWORD --env production
+# Set production secrets (once, entered interactively)
+wrangler secret put CSVKEY
+wrangler secret put DATAFORSEO_LOGIN
+wrangler secret put DATAFORSEO_PASSWORD
 
-# Deploy to production
-wrangler deploy --env production
-
-# Deploy to staging
+# Deploy to staging (set its secrets the same way, with --env staging)
 wrangler deploy --env staging
+
+# Deploy to production by hand (a push to main normally does this)
+wrangler deploy
 ```
 
-A bare `wrangler deploy` (no `--env`) deploys to `rusty-serp-dev`, not production. This is by design; the top-level name in `wrangler.toml` differs from the production name to prevent accidental production deployments.
+### Workers Builds Setup (Cloudflare Dashboard)
 
-### Deploying via the Cloudflare Dashboard
-
-If you prefer not to use the Wrangler CLI, you can deploy directly through the Cloudflare dashboard by connecting your GitHub repository.
+This is how production deployment is set up. Repeat it only to connect a new Worker to the repository.
 
 1. Log in to the [Cloudflare dashboard](https://dash.cloudflare.com/) and navigate to **Workers & Pages**.
 2. Click **Create** and select **Import a repository**.
@@ -337,11 +339,13 @@ To roll back a deployment, navigate to **Workers & Pages > rusty-serp > Deployme
 
 ### Environment Names
 
-| Command | Worker Name | Purpose |
-|---------|-------------|---------|
-| `wrangler deploy` | `rusty-serp-dev` | Development (safe default) |
+| How | Worker Name | Purpose |
+|-----|-------------|---------|
+| Push to `main` (Workers Builds) | `rusty-serp` | Production |
+| `wrangler deploy` | `rusty-serp` | Production |
+| `wrangler deploy --env production` | `rusty-serp` | Production (same Worker) |
 | `wrangler deploy --env staging` | `rusty-serp-staging` | Pre-production testing |
-| `wrangler deploy --env production` | `rusty-serp` | Production |
+| `wrangler dev` | none (local) | Local development |
 
 ## Cost Reference
 

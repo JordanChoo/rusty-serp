@@ -5,3 +5,8 @@ build/
 node_modules/
 .wrangler/
 .claude/settings.local.json
+# Local agent tooling state; these can hold access tokens
+.claude/.settings.local.json.*.bak
+*.mcp.json
+.*.mcp.json.*.bak
+.ntm/

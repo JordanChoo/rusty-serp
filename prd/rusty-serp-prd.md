@@ -563,11 +563,14 @@ These are set via `wrangler secret put <NAME>` and accessed via `env.var("<NAME>
 ### 5.2 Wrangler Configuration
 
 ```toml
-name = "rusty-serp-dev"
+name = "rusty-serp"
 main = "build/worker/shim.mjs"
-compatibility_date = "2026-05-20"
+compatibility_date = "2026-05-03"
 
 [build]
+# worker-build accepts only a `worker` crate of its own minor version (0.9.x here),
+# and patch releases have broken builds too, so it is pinned exactly. Bump it
+# together with `worker` in Cargo.toml.
 command = "curl https://sh.rustup.rs -sSf | sh -s -- -y --default-toolchain stable && . \"$HOME/.cargo/env\" && rustup target add wasm32-unknown-unknown && cargo install -q worker-build --version 0.9.0 --locked && worker-build --release"
 
 [env.staging]
@@ -582,7 +585,7 @@ name = "rusty-serp"
 - **Pinned `worker-build`**: `--version 0.9.0 --locked` installs an exact release. `worker-build` accepts only a `worker` crate of its own minor version, so once `worker-build` 0.9.0 came out, the unpinned install could no longer build this project on `worker` 0.8. The pin is exact rather than `^0.9` because a patch release can break the build too: `worker-build` 0.8.7 passes wasm-bindgen a flag that the CLI version locked here at the time (0.2.122) did not support. Bump it together with `worker` in `Cargo.toml`.
 - **No `[vars]` section**: All configuration is via secrets. No environment variables are needed for this Worker.
 - **Staging and production environments**: Allows separate secret sets for testing vs. production.
-- **Top-level `name` is `rusty-serp-dev`**: The top-level name is used for bare `wrangler deploy` (no `--env` flag) and local `wrangler dev`. It is intentionally different from the `[env.production]` name (`rusty-serp`) to prevent accidental production deployments. A bare `wrangler deploy` deploys to the `rusty-serp-dev` Worker, which is harmless. To deploy to production, you **must** explicitly pass `--env production`. If the top-level name were also `rusty-serp`, a bare `wrangler deploy` would overwrite the production Worker.
+- **Top-level `name` is `rusty-serp`, the production Worker**: Production is deployed by Cloudflare Workers Builds, which is connected to the `rusty-serp` Worker and runs `npx wrangler deploy` on every push to `main`. Workers Builds fails the build unless the top-level `name` matches the connected Worker. It opened a pull request (#1, May 2026) renaming the original `rusty-serp-dev` to `rusty-serp`. As a result, a bare `wrangler deploy` from a developer machine also deploys to production, and so does `--env production`, which names the same Worker. There is no separate dev Worker. Use `--env staging` (`rusty-serp-staging`) for anything that must not reach production, and `wrangler dev` for local testing.
 
 ### 5.3 Cargo Configuration
 
@@ -1233,15 +1236,16 @@ npm install -g wrangler
 wrangler login
 
 # 4. Set production secrets (wrangler will prompt you to enter each value interactively)
-wrangler secret put CSVKEY --env production
-wrangler secret put DATAFORSEO_LOGIN --env production
-wrangler secret put DATAFORSEO_PASSWORD --env production
+wrangler secret put CSVKEY
+wrangler secret put DATAFORSEO_LOGIN
+wrangler secret put DATAFORSEO_PASSWORD
 
-# 5. Deploy to production
-wrangler deploy --env production
+# 5. Deploy to production: push to `main` (Workers Builds builds and deploys it),
+#    or deploy by hand
+wrangler deploy
 ```
 
-**Important:** Always use `--env production` or `--env staging` when deploying. A bare `wrangler deploy` (no `--env` flag) deploys to the `rusty-serp-dev` Worker (the top-level name in `wrangler.toml`), which is intended for development only. See Section 5.2 for why the names are intentionally different.
+**Important:** The top-level config in `wrangler.toml` is production (Section 5.2). A bare `wrangler deploy` and `wrangler deploy --env production` both deploy to the production `rusty-serp` Worker, as does every push to `main`. Use `--env staging` for anything that must not reach production.
 
 ### 10.2 Environment-Specific Deployment
 
@@ -1256,29 +1260,24 @@ wrangler secret put DATAFORSEO_PASSWORD --env staging
 # Deploy to staging (Worker name: rusty-serp-staging)
 wrangler deploy --env staging
 
-# --- Production ---
+# --- Production (Worker name: rusty-serp) ---
 
-# Set production secrets (only needed once, or when rotating credentials)
-wrangler secret put CSVKEY --env production
-wrangler secret put DATAFORSEO_LOGIN --env production
-wrangler secret put DATAFORSEO_PASSWORD --env production
-
-# Deploy to production (Worker name: rusty-serp)
-wrangler deploy --env production
-
-# --- Dev (for testing only, not for agents to call) ---
-
-# A bare deploy goes to rusty-serp-dev. Secrets must be set without --env.
+# Set production secrets (only needed once, or when rotating credentials).
+# Without --env and with --env production, these target the same Worker.
 wrangler secret put CSVKEY
 wrangler secret put DATAFORSEO_LOGIN
 wrangler secret put DATAFORSEO_PASSWORD
+
+# Deploy to production. Normally a push to `main` does this through Workers Builds.
 wrangler deploy
 ```
+
+There is no dev Worker. Use `wrangler dev` for local testing and `--env staging` for a deployed test copy.
 
 ### 10.3 Monitoring
 
 ```bash
-# Tail live logs
+# Tail production logs
 wrangler tail
 
 # Tail staging logs
@@ -1370,7 +1369,7 @@ rusty-serp/
   .gitignore                 # Must include: .dev.vars, target/, build/, node_modules/
   Cargo.toml                 # Rust package manifest (5 dependencies)
   Cargo.lock                 # Dependency lock file (generated)
-  wrangler.toml              # Cloudflare Worker configuration (top-level name: rusty-serp-dev)
+  wrangler.toml              # Cloudflare Worker configuration (top-level name: rusty-serp, production)
   LICENSE                    # Project license
   README.md                  # Project overview and usage
   prd/
