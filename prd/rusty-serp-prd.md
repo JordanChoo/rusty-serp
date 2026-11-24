@@ -763,6 +763,7 @@ pub async fn parse_and_validate_body(req: &mut Request) -> std::result::Result<S
     let body_text = req.text().await
         .map_err(|_| json_error(400, "Failed to read request body (body may be missing, empty, or not valid UTF-8)", "missing_body").unwrap())?;
 
+    // In the real code, everything below lives in validate_body(&body_text).
     if body_text.trim().is_empty() {
         return Err(json_error(400, "Request body is empty", "missing_body").unwrap());
     }

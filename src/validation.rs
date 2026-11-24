@@ -218,6 +218,8 @@ mod tests {
             "depth": 200,
         });
 
+        // In a native test run, a rejection panics inside `web_sys` while
+        // building the error `Response`, before this `else` is reached.
         let Ok(request) = validate_body(&body.to_string()) else {
             panic!("a 700-character keyword and depth 200 must be accepted");
         };
