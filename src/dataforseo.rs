@@ -1,6 +1,7 @@
 use crate::errors::{dataforseo_error, json_error, task_timeout_error};
 use crate::validation::{Location, SerpRequest};
 use base64::Engine;
+use serde::Deserialize;
 use std::time::Duration;
 use worker::*;
 
@@ -22,27 +23,57 @@ const HIGH_PRIORITY: u8 = 2;
 const FIRST_POLL_AFTER_MS: u64 = 10_000;
 /// Wait between result requests.
 const POLL_INTERVAL_MS: u64 = 6_000;
-/// Overall limit for one call, counted from just before the task is set. It
-/// leaves room under the 300-second client timeout the README recommends, so a
-/// caller gets a 504 from the Worker rather than its own timeout.
+/// Overall limit for one call, counted from just before the task is set. No
+/// result request starts after it. It leaves room under the 300-second client
+/// timeout the README recommends, so a caller gets a 504 from the Worker rather
+/// than its own timeout.
 const DEADLINE_MS: u64 = 280_000;
-/// Failed result requests in a row (network error, non-2xx status, body that
-/// is not JSON) before the Worker gives up on the task.
+/// Longest wait for one result request, body included. These normally take well
+/// under a second; one that hangs is abandoned and counts as a failure, so it
+/// cannot hold the Worker's answer past the client timeout. (The task_post
+/// request has no limit of its own: abandoning it could leave a paid task
+/// whose ID nobody has. Cloudflare's 125-second cutoff bounds it.)
+const POLL_TIMEOUT_MS: u32 = 10_000;
+/// Failed result requests in a row (network error, timeout, non-2xx status,
+/// unreadable body, DataForSEO server error) before the Worker gives up on the
+/// task.
 const MAX_POLL_FAILURES: u32 = 3;
 /// Most outbound requests one call can make: the task_post request plus every
 /// result request the deadline allows.
 const MAX_SUBREQUESTS: u64 = 1 + (DEADLINE_MS - FIRST_POLL_AFTER_MS) / POLL_INTERVAL_MS + 1;
 
 // Checked when compiling: Workers Free allows 50 subrequests per invocation,
-// and the Worker must answer before the 300-second client timeout.
+// and the Worker's answer (at worst, one result request that starts at the
+// deadline and times out) must come at least 10 seconds before the 300-second
+// client timeout, leaving time for the request's travel and the download.
 const _: () = assert!(MAX_SUBREQUESTS <= 50);
-const _: () = assert!(DEADLINE_MS + POLL_INTERVAL_MS < 300_000);
+const _: () = assert!(DEADLINE_MS + POLL_TIMEOUT_MS as u64 <= 290_000);
 
 /// task_post status code for a task that was created.
 const TASK_CREATED: i64 = 20100;
 /// task_get status codes for a task that has not finished: 40601 "Task Handed"
 /// (received, not yet queued) and 40602 "Task In Queue".
 const PENDING_STATUS_CODES: [i64; 2] = [40601, 40602];
+/// DataForSEO reports its own server errors as HTTP 200 with a `status_code`
+/// from 50000 up. On a result request such an error says nothing about the
+/// task, which may still finish, so it counts as a failed request.
+const FIRST_SERVER_ERROR: i64 = 50000;
+
+/// The status codes of a task_get response, and nothing else.
+///
+/// Deserializing into this skips the rest of the body without building it, so
+/// a large result costs little CPU time. For a 1.9 MB result (about depth 200)
+/// that took a tenth of the time of parsing it whole, in a native benchmark.
+#[derive(Deserialize)]
+struct StatusCodes {
+    status_code: Option<i64>,
+    tasks: Option<Vec<TaskStatusCode>>,
+}
+
+#[derive(Deserialize)]
+struct TaskStatusCode {
+    status_code: Option<i64>,
+}
 
 /// Builds the DataForSEO task_post body: an array holding one task.
 ///
@@ -109,25 +140,37 @@ fn task_get_url(task_id: &str, ai_optimized: bool) -> Option<String> {
 /// The standard format carries the task's status in `tasks[0].status_code`;
 /// the `.ai` format puts it in the top-level `status_code`. A response without
 /// a status code counts as finished and is passed through to the caller.
-fn is_pending(body: &serde_json::Value, ai_optimized: bool) -> bool {
+fn is_pending(codes: &StatusCodes, ai_optimized: bool) -> bool {
     let status = if ai_optimized {
-        body.get("status_code")
+        codes.status_code
     } else {
-        body.get("tasks")
-            .and_then(|tasks| tasks.get(0))
-            .and_then(|task| task.get("status_code"))
+        codes
+            .tasks
+            .as_ref()
+            .and_then(|tasks| tasks.first())
+            .and_then(|task| task.status_code)
     };
-    status
-        .and_then(serde_json::Value::as_i64)
-        .is_some_and(|code| PENDING_STATUS_CODES.contains(&code))
+    status.is_some_and(|code| PENDING_STATUS_CODES.contains(&code))
+}
+
+/// Whether a task_get response is a DataForSEO server error rather than news
+/// of the task. The top-level `status_code` is read in both formats.
+fn is_server_error(codes: &StatusCodes) -> bool {
+    codes
+        .status_code
+        .is_some_and(|code| code >= FIRST_SERVER_ERROR)
 }
 
 /// Sends one request to DataForSEO and returns its status and body text.
+///
+/// With `timeout_ms`, the request is abandoned if the whole response, body
+/// included, has not arrived in that time; it then fails as a timeout.
 async fn send(
     url: &str,
     method: Method,
     auth_header: &str,
     body: Option<String>,
+    timeout_ms: Option<u32>,
 ) -> std::result::Result<(u16, String), Response> {
     let headers = Headers::new();
     headers.set("Authorization", auth_header).map_err(|_| {
@@ -151,7 +194,14 @@ async fn send(
         json_error(500, "Failed to build outbound request", "missing_config").unwrap()
     })?;
 
-    let mut response = Fetch::Request(outbound).send().await.map_err(|e| {
+    // The signal also covers reading the body, so it stays alive until then.
+    let signal = timeout_ms.map(|ms| AbortSignal::from(web_sys::AbortSignal::timeout_with_u32(ms)));
+    let fetch = Fetch::Request(outbound);
+    let sent = match &signal {
+        Some(signal) => fetch.send_with_signal(signal).await,
+        None => fetch.send().await,
+    };
+    let mut response = sent.map_err(|e| {
         let err_msg = format!("Fetch failed: {}", e);
         let err_lower = err_msg.to_lowercase();
         if err_lower.contains("timeout") || err_lower.contains("timed out") {
@@ -171,19 +221,25 @@ async fn send(
 /// Asks DataForSEO for the task's result once.
 ///
 /// `Ok(Some(body))` is the finished task's response, `Ok(None)` means the task
-/// is still running, and `Err` is a failed request, which the caller may retry.
+/// is still running, and `Err` is a failed request, which the caller may retry:
+/// a failed fetch or timeout, a non-2xx status, a body without DataForSEO's
+/// status codes, or a DataForSEO server error.
 async fn poll_once(
     url: &str,
     auth_header: &str,
     ai_optimized: bool,
 ) -> std::result::Result<Option<String>, Response> {
-    let (status, body_text) = send(url, Method::Get, auth_header, None).await?;
+    let (status, body_text) =
+        send(url, Method::Get, auth_header, None, Some(POLL_TIMEOUT_MS)).await?;
     if !(200..300).contains(&status) {
         return Err(dataforseo_error(status, &body_text, None).unwrap());
     }
-    let body: serde_json::Value = serde_json::from_str(&body_text)
+    let codes: StatusCodes = serde_json::from_str(&body_text)
         .map_err(|_| dataforseo_error(status, &body_text, None).unwrap())?;
-    Ok((!is_pending(&body, ai_optimized)).then_some(body_text))
+    if is_server_error(&codes) {
+        return Err(dataforseo_error(status, &body_text, None).unwrap());
+    }
+    Ok((!is_pending(&codes, ai_optimized)).then_some(body_text))
 }
 
 /// Wraps a DataForSEO response body, unchanged, in a `200` JSON response.
@@ -213,8 +269,14 @@ pub async fn fetch_serp(
 
     let started_ms = Date::now().as_millis();
     let payload = build_payload(request).to_string();
-    let (status, post_text) =
-        send(TASK_POST_URL, Method::Post, &auth_header, Some(payload)).await?;
+    let (status, post_text) = send(
+        TASK_POST_URL,
+        Method::Post,
+        &auth_header,
+        Some(payload),
+        None,
+    )
+    .await?;
     if !(200..300).contains(&status) {
         return Err(dataforseo_error(status, &post_text, None).unwrap());
     }
@@ -317,24 +379,65 @@ mod tests {
         assert_eq!(task_get_url("", false), None);
     }
 
+    fn codes(body: serde_json::Value) -> StatusCodes {
+        serde_json::from_value(body).expect("body must have DataForSEO's status codes")
+    }
+
     #[test]
     fn pending_is_read_from_the_right_field_for_each_format() {
         for code in [40601, 40602] {
             let standard =
-                serde_json::json!({"status_code": 20000, "tasks": [{"status_code": code}]});
+                codes(serde_json::json!({"status_code": 20000, "tasks": [{"status_code": code}]}));
             assert!(is_pending(&standard, false));
-            let ai = serde_json::json!({"id": TASK_ID, "status_code": code, "items": []});
+            let ai = codes(serde_json::json!({"id": TASK_ID, "status_code": code, "items": []}));
             assert!(is_pending(&ai, true));
         }
 
-        let done = serde_json::json!({"status_code": 20000, "tasks": [{"status_code": 20000}]});
+        let done =
+            codes(serde_json::json!({"status_code": 20000, "tasks": [{"status_code": 20000}]}));
         assert!(!is_pending(&done, false));
-        let done_ai = serde_json::json!({"id": TASK_ID, "status_code": 20000, "items": []});
+        let done_ai = codes(serde_json::json!({"id": TASK_ID, "status_code": 20000, "items": []}));
         assert!(!is_pending(&done_ai, true));
 
-        let failed = serde_json::json!({"status_code": 20000, "tasks": [{"status_code": 40102}]});
+        let failed =
+            codes(serde_json::json!({"status_code": 20000, "tasks": [{"status_code": 40102}]}));
         assert!(!is_pending(&failed, false));
-        let no_status = serde_json::json!({"status_code": 50000, "tasks": null});
-        assert!(!is_pending(&no_status, false));
+        let no_tasks = codes(serde_json::json!({"status_code": 40401, "tasks": null}));
+        assert!(!is_pending(&no_tasks, false));
+    }
+
+    #[test]
+    fn only_a_top_level_server_error_counts_as_a_failed_request() {
+        let standard = codes(
+            serde_json::json!({"status_code": 50000, "status_message": "Internal Error.", "tasks": null}),
+        );
+        assert!(is_server_error(&standard));
+        let ai = codes(
+            serde_json::json!({"status_code": 50301, "status_message": "Service Unavailable."}),
+        );
+        assert!(is_server_error(&ai));
+
+        // A task that itself ended in an error is a result: it is passed through.
+        let task_error =
+            codes(serde_json::json!({"status_code": 20000, "tasks": [{"status_code": 50000}]}));
+        assert!(!is_server_error(&task_error));
+        let pending =
+            codes(serde_json::json!({"status_code": 20000, "tasks": [{"status_code": 40602}]}));
+        assert!(!is_server_error(&pending));
+    }
+
+    #[test]
+    fn status_codes_are_read_from_a_full_result_and_not_from_other_bodies() {
+        let result = r#"{"version":"0.1.20260101","status_code":20000,"status_message":"Ok.",
+            "tasks":[{"id":"11260820-1535-0139-0000-7b3c1d2e4f5a","status_code":20000,"cost":0.0024,
+            "data":{"priority":2},"result":[{"keyword":"x","items":[{"type":"organic","rank_group":1,
+            "url":"https://example.com/","checks":null,"links":[{"url":"https://example.com/a"}]}]}]}]}"#;
+        let parsed: StatusCodes = serde_json::from_str(result).expect("a full result must parse");
+        assert_eq!(parsed.status_code, Some(20000));
+        assert!(!is_pending(&parsed, false));
+        assert!(!is_server_error(&parsed));
+
+        assert!(serde_json::from_str::<StatusCodes>("error code: 524").is_err());
+        assert!(serde_json::from_str::<StatusCodes>("").is_err());
     }
 }

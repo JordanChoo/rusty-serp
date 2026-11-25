@@ -49,7 +49,7 @@ rusty-serp centralizes all of this behind a single HTTP endpoint. Agents send a 
 
 Cloudflare ends a Worker's outbound request with a `524` error when the server sends nothing for 125 seconds (its [Proxy Read Timeout](https://developers.cloudflare.com/fundamentals/reference/connection-limits/), which only Enterprise zones can raise). With redirect resolution and the poisoned-result check always on, DataForSEO needs longer than that, so a single Live request was cut off. Instead, the Worker sets a task and polls for it, and every one of those requests returns at once. Only the Worker's answer to its caller takes long, and Cloudflare doesn't cut that off: a test Worker answered after 200 seconds.
 
-The Worker gives up after 280 seconds and answers `504` with code `dataforseo_timeout`. One call makes at most 47 requests to DataForSEO, within the 50 that the Workers Free plan allows.
+The Worker gives up after 280 seconds and answers `504` with code `dataforseo_timeout`. It abandons any result request that takes longer than 10 seconds, so it answers within about 290 seconds even if DataForSEO stops responding. One call makes at most 47 requests to DataForSEO, within the 50 that the Workers Free plan allows. The Worker reads only the status codes from each result, without building the rest of the document, so even a large result costs little CPU time.
 
 ### Module Structure
 
@@ -185,7 +185,7 @@ All errors return a consistent JSON shape:
 | 404 | `not_found` | Unrecognized path |
 | 405 | `method_not_allowed` | Wrong HTTP method for the path |
 | 500 | `missing_config` | Server secret not configured |
-| 502 | `dataforseo_error` | DataForSEO returned non-2xx or fetch failed (for a result request: three times in a row) |
+| 502 | `dataforseo_error` | DataForSEO returned non-2xx or fetch failed. For a result request, three times in a row, where a DataForSEO server error (`status_code` 50000 or higher) also counts as a failure |
 | 504 | `dataforseo_timeout` | The task did not finish within 280 seconds (the body adds `dataforseo_task_id`), or a fetch-level timeout |
 
 **DataForSEO errors** include additional context:
@@ -263,7 +263,7 @@ serp_tool = Tool(
 - **Use `ai_optimized: false`** when agents need full metadata (rectangles, XPath, position data, cost breakdown).
 - **Set `depth` conservatively.** Start with `10` (default). Each additional 10 results adds ~$0.0012.
 - **Check `status_code` in the response body.** A `200` HTTP response does not guarantee SERP success; look for `20000` in the JSON.
-- **Set agent tool timeout to 300 seconds.** Redirect resolution and the poisoned-result check are always on. DataForSEO caps redirect resolution at 260 seconds in total and gives no time figure for the check; in testing, requests took 145 to 186 seconds. The Worker gives up at 280 seconds and answers `504`, so a 300-second client timeout always gets an answer from the Worker.
+- **Set agent tool timeout to 300 seconds.** Redirect resolution and the poisoned-result check are always on. DataForSEO caps redirect resolution at 260 seconds in total and gives no time figure for the check; in testing, requests took 145 to 186 seconds. The Worker gives up at 280 seconds and answers `504`, and abandons any result request after 10 seconds, so it answers within about 290 seconds and a 300-second client timeout always gets the Worker's answer.
 - **Handle non-JSON errors.** If the Worker throws an exception or the connection drops, agents receive a Cloudflare HTML error page or a connection reset, not a JSON response.
 
 ## Common Location Codes
