@@ -555,6 +555,7 @@ The Worker reads only the task ID and status codes. It does not validate or tran
 | Scenario | What the caller sees |
 |----------|---------------------|
 | The task finishes within 280 seconds | Normal `200` response with DataForSEO's JSON body, including task-level errors in its `status_code`. |
+| DataForSEO's rate limits still turn task_post away after a minute of resending | A `200` with DataForSEO's task_post response, carrying `40202` or `40209` in its `status_code`. No task was set and nothing was paid; retry later. |
 | The task is still running after 280 seconds, or DataForSEO's rate limits turn result requests away until then | A `504` JSON response with code `dataforseo_timeout` and `dataforseo_task_id`. DataForSEO may still finish the task and charge for it. |
 | Three result requests in a row fail (including timeouts and DataForSEO server errors) | A `502` `dataforseo_error` (or `504` `dataforseo_timeout` if the last one timed out) describing the last failure. |
 | The caller's own timeout fires first | The caller gets nothing from rusty-serp; its HTTP client reports a timeout. Cloudflare may cancel the Worker, and the result is lost, though DataForSEO charged for the task when it was set. |
@@ -940,8 +941,9 @@ const PENDING_STATUS_CODES: [i64; 2] = [40601, 40602]; // Task Handed, Task In Q
 const BUSY_STATUS_CODES: [i64; 2] = [40202, 40209]; // rate limits, sent with HTTP 200
 const FIRST_SERVER_ERROR: i64 = 50000; // DataForSEO server errors, sent with HTTP 200
 
-/// The status codes of a task_get response, and nothing else. Deserializing
-/// into this skips the rest of the body without building it.
+/// The status codes of a task_get response (or of a task_post response being
+/// checked for a rate limit), and nothing else. Deserializing into this skips
+/// the rest of the body without building it.
 #[derive(Deserialize)]
 struct StatusCodes {
     status_code: Option<i64>,

@@ -32,16 +32,17 @@ const DEADLINE_MS: u64 = 280_000;
 /// under a second; one that hangs is abandoned and counts as a failure, so it
 /// cannot hold the Worker's answer past the client timeout. (The task_post
 /// request has no limit of its own: abandoning it could leave a paid task
-/// whose ID nobody has. Cloudflare's 125-second cutoff bounds it.)
+/// whose ID nobody has. Cloudflare's cutoff, `CLOUDFLARE_CUTOFF_MS`, bounds it.)
 const POLL_TIMEOUT_MS: u32 = 10_000;
 /// Failed result requests in a row (network error, timeout, non-2xx status,
 /// unreadable body, DataForSEO server error) before the Worker gives up on the
 /// task.
 const MAX_POLL_FAILURES: u32 = 3;
-/// How long, counted like the deadline, a task_post that DataForSEO's rate
-/// limits turn away is sent again, every `POLL_INTERVAL_MS`. Such a request
-/// set no task and cost nothing. A minute outlasts the per-minute limit and
-/// still leaves the task about 220 seconds before the deadline.
+/// A task_post that DataForSEO's rate limits turn away is sent again every
+/// `POLL_INTERVAL_MS`, as long as the next attempt starts within this time of
+/// the first (counted from the same moment as the deadline). Such a request set
+/// no task and cost nothing. A minute outlasts the per-minute limit and still
+/// leaves the task about 220 seconds before the deadline.
 const POST_RETRY_WINDOW_MS: u64 = 60_000;
 /// Cloudflare's cutoff for an outbound request whose server sends nothing.
 const CLOUDFLARE_CUTOFF_MS: u64 = 125_000;
@@ -85,7 +86,8 @@ const BUSY_STATUS_CODES: [i64; 2] = [40202, 40209];
 /// too, and after three tries ends as a 502 rather than a 200.)
 const FIRST_SERVER_ERROR: i64 = 50000;
 
-/// The status codes of a task_get response, and nothing else.
+/// The status codes of a DataForSEO response, and nothing else: a task_get
+/// response, or a task_post response being checked for a rate limit.
 ///
 /// Deserializing into this skips the rest of the body without building it, so
 /// a large result costs little CPU time. For a 1.9 MB result (about depth 200)
@@ -572,6 +574,7 @@ mod tests {
         let parsed: StatusCodes = serde_json::from_str(result).expect("a full result must parse");
         assert_eq!(parsed.status_code, Some(20000));
         assert!(!is_pending(&parsed, false));
+        assert!(!is_busy(&parsed));
         assert!(!is_server_error(&parsed));
 
         assert!(serde_json::from_str::<StatusCodes>("error code: 524").is_err());
