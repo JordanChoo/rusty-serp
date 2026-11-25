@@ -33,6 +33,20 @@ pub fn dataforseo_error(
     Ok(resp.with_status(502))
 }
 
+/// The task did not finish before the Worker's deadline. DataForSEO may still
+/// finish it and charge for it; the task ID lets someone look it up.
+pub fn task_timeout_error(task_id: &str) -> Result<Response> {
+    let payload = serde_json::json!({
+        "error": "DataForSEO task did not finish in time",
+        "code": "dataforseo_timeout",
+        "dataforseo_task_id": task_id,
+    });
+
+    let mut resp = Response::ok(payload.to_string())?;
+    resp.headers_mut().set("Content-Type", "application/json")?;
+    Ok(resp.with_status(504))
+}
+
 fn truncate(s: &str, max_bytes: usize) -> &str {
     if s.len() <= max_bytes {
         return s;
