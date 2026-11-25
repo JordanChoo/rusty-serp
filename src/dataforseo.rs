@@ -38,16 +38,30 @@ const POLL_TIMEOUT_MS: u32 = 10_000;
 /// unreadable body, DataForSEO server error) before the Worker gives up on the
 /// task.
 const MAX_POLL_FAILURES: u32 = 3;
-/// Most outbound requests one call can make: the task_post request plus every
-/// result request the deadline allows.
-const MAX_SUBREQUESTS: u64 = 1 + (DEADLINE_MS - FIRST_POLL_AFTER_MS) / POLL_INTERVAL_MS + 1;
+/// How long, counted like the deadline, a task_post that DataForSEO's rate
+/// limits turn away is sent again, every `POLL_INTERVAL_MS`. Such a request
+/// set no task and cost nothing. A minute outlasts the per-minute limit and
+/// still leaves the task about 220 seconds before the deadline.
+const POST_RETRY_WINDOW_MS: u64 = 60_000;
+/// Cloudflare's cutoff for an outbound request whose server sends nothing.
+const CLOUDFLARE_CUTOFF_MS: u64 = 125_000;
+/// Most outbound requests one call can make. Each starts at least
+/// `POLL_INTERVAL_MS` after the one before (a resent task_post waits that long,
+/// and the first result request waits `FIRST_POLL_AFTER_MS`, which is longer),
+/// and none starts after the deadline.
+const MAX_SUBREQUESTS: u64 = 1 + DEADLINE_MS / POLL_INTERVAL_MS;
 
 // Checked when compiling: Workers Free allows 50 subrequests per invocation,
-// and the Worker's answer (at worst, one result request that starts at the
-// deadline and times out) must come at least 10 seconds before the 300-second
-// client timeout, leaving time for the request's travel and the download.
+// and the Worker's answer must come at least 10 seconds before the 300-second
+// client timeout, leaving time for the request's travel and the download. At
+// worst that answer follows one result request that starts at the deadline and
+// times out, or a task_post that starts at the end of its retry window and
+// runs into Cloudflare's cutoff.
+const _: () = assert!(FIRST_POLL_AFTER_MS >= POLL_INTERVAL_MS);
+const _: () = assert!(POST_RETRY_WINDOW_MS <= DEADLINE_MS);
 const _: () = assert!(MAX_SUBREQUESTS <= 50);
 const _: () = assert!(DEADLINE_MS + POLL_TIMEOUT_MS as u64 <= 290_000);
+const _: () = assert!(POST_RETRY_WINDOW_MS + CLOUDFLARE_CUTOFF_MS <= 290_000);
 
 /// task_post status code for a task that was created.
 const TASK_CREATED: i64 = 20100;
@@ -59,9 +73,10 @@ const PENDING_STATUS_CODES: [i64; 2] = [40601, 40602];
 /// requests, counted across everything that uses the account). They come with
 /// HTTP 200 and say nothing about the task, so a result request that gets one
 /// is treated like a pending task: the Worker waits and asks again, until the
-/// deadline. DataForSEO does not say where in the body they appear, and no
-/// finished task carries either one, so both the top-level code and
-/// `tasks[0]`'s are read.
+/// deadline. A task_post that gets one is sent again for a while (see
+/// `POST_RETRY_WINDOW_MS`). DataForSEO does not say where in the body they
+/// appear, and no finished task carries either one, so both the top-level code
+/// and `tasks[0]`'s are read.
 const BUSY_STATUS_CODES: [i64; 2] = [40202, 40209];
 /// DataForSEO reports its own server errors as HTTP 200 with a `status_code`
 /// from 50000 up. A result request that gets one counts as failed, since the
@@ -133,6 +148,13 @@ fn created_task_id(body: &serde_json::Value) -> Option<&str> {
     task.get("id")?.as_str()
 }
 
+/// Whether DataForSEO's rate limits turned a task_post request away. It then
+/// set no task, so it can be sent again without paying twice.
+fn post_is_busy(body: &serde_json::Value) -> bool {
+    created_task_id(body).is_none()
+        && StatusCodes::deserialize(body).is_ok_and(|codes| is_busy(&codes))
+}
+
 /// The task_get URL for a task, in the `.ai` format when `ai_optimized` is set.
 ///
 /// Returns `None` unless the ID looks like the UUID DataForSEO issues, so that
@@ -164,8 +186,8 @@ fn is_pending(codes: &StatusCodes, ai_optimized: bool) -> bool {
     status.is_some_and(|code| PENDING_STATUS_CODES.contains(&code))
 }
 
-/// Whether DataForSEO turned a task_get request away for the moment (a rate
-/// limit) instead of reporting on the task. The top-level `status_code` and
+/// Whether DataForSEO turned a request away for the moment (a rate limit)
+/// instead of reporting on the task. The top-level `status_code` and
 /// `tasks[0].status_code` are both read, in both formats.
 fn is_busy(codes: &StatusCodes) -> bool {
     let task_code = codes
@@ -299,7 +321,8 @@ fn pass_through(body_text: String) -> std::result::Result<Response, Response> {
 /// The finished task's task_get response is returned verbatim. So is a
 /// task_post response whose task was not created (an invalid field or an empty
 /// balance, for example), because it carries DataForSEO's error in its
-/// `status_code` the same way.
+/// `status_code` the same way. A task_post that DataForSEO's rate limits turn
+/// away is first sent again for up to `POST_RETRY_WINDOW_MS`.
 pub async fn fetch_serp(
     request: &SerpRequest,
     login: &str,
@@ -311,19 +334,29 @@ pub async fn fetch_serp(
 
     let started_ms = Date::now().as_millis();
     let payload = build_payload(request).to_string();
-    let (status, post_text) = send(
-        TASK_POST_URL,
-        Method::Post,
-        &auth_header,
-        Some(payload),
-        None,
-    )
-    .await?;
-    if !(200..300).contains(&status) {
-        return Err(dataforseo_error(status, &post_text, None).unwrap());
-    }
-    let post_body: serde_json::Value = serde_json::from_str(&post_text)
-        .map_err(|_| dataforseo_error(status, &post_text, None).unwrap())?;
+    let (status, post_text, post_body) = loop {
+        let (status, post_text) = send(
+            TASK_POST_URL,
+            Method::Post,
+            &auth_header,
+            Some(payload.clone()),
+            None,
+        )
+        .await?;
+        if !(200..300).contains(&status) {
+            return Err(dataforseo_error(status, &post_text, None).unwrap());
+        }
+        let post_body: serde_json::Value = serde_json::from_str(&post_text)
+            .map_err(|_| dataforseo_error(status, &post_text, None).unwrap())?;
+
+        let elapsed_ms = Date::now().as_millis().saturating_sub(started_ms);
+        let send_again =
+            post_is_busy(&post_body) && elapsed_ms + POLL_INTERVAL_MS <= POST_RETRY_WINDOW_MS;
+        if !send_again {
+            break (status, post_text, post_body);
+        }
+        Delay::from(Duration::from_millis(POLL_INTERVAL_MS)).await;
+    };
 
     let Some(task_id) = created_task_id(&post_body) else {
         return pass_through(post_text);
@@ -405,6 +438,32 @@ mod tests {
 
         let no_tasks = serde_json::json!({"status_code": 40100, "tasks": null});
         assert_eq!(created_task_id(&no_tasks), None);
+    }
+
+    #[test]
+    fn only_a_rate_limited_task_post_is_sent_again() {
+        for code in [40202, 40209] {
+            let top_level = serde_json::json!({"status_code": code, "tasks": null});
+            assert!(post_is_busy(&top_level));
+            let in_task = serde_json::json!({
+                "status_code": 20000,
+                "tasks": [{"id": TASK_ID, "status_code": code, "status_message": "busy"}],
+            });
+            assert!(post_is_busy(&in_task));
+        }
+
+        let created = serde_json::json!({
+            "status_code": 20000,
+            "tasks": [{"id": TASK_ID, "status_code": 20100, "status_message": "Task Created."}],
+        });
+        assert!(!post_is_busy(&created));
+        let invalid_field = serde_json::json!({
+            "status_code": 20000,
+            "tasks": [{"id": TASK_ID, "status_code": 40501, "status_message": "Invalid Field"}],
+        });
+        assert!(!post_is_busy(&invalid_field));
+        let no_funds = serde_json::json!({"status_code": 40210, "tasks": null});
+        assert!(!post_is_busy(&no_funds));
     }
 
     #[test]

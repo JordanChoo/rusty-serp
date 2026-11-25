@@ -95,6 +95,7 @@ Adapted from the architecture patterns established in [rusty-gateway](https://gi
 10. Worker constructs the task_post body (priority: 2; always sets load_async_ai_overview: true, resolve_goto_urls: true and resolve_poisoned_results: true)
 11. Worker sends POST to .../task_post with Basic Auth
     - non-2xx or unreadable response -> 502
+    - turned away by a rate limit (40202 or 40209, at the top level or in tasks[0]; no task set, nothing paid) -> wait 6 s and send it again, while the next attempt starts within 60 s of the first
     - task not created (tasks[0].status_code != 20100) -> return the task_post response verbatim with status 200
 12. Worker waits 10 s, then sends GET with Basic Auth to the result URL:
     - ai_optimized == true  -> .../task_get/advanced/{id}.ai
@@ -528,7 +529,7 @@ The Worker constructs the task_post body as a JSON array containing a single tas
 **task_post:**
 1. **Read the response body as text.** This is done regardless of status code to capture error details.
 2. **Check HTTP status code.** If not in the 2xx range, or the body is not JSON, return a `502` `dataforseo_error` response with the upstream status and truncated body.
-3. **Check that the task was created** (`tasks[0].status_code` is `20100`). If not, return the task_post response verbatim with status `200`: it carries DataForSEO's error (for example `40501` invalid field or `40210` insufficient funds) in `tasks[0].status_code`, like any other task-level error.
+3. **Check that the task was created** (`tasks[0].status_code` is `20100`). If DataForSEO's rate limits turned the request away instead (`40202` or `40209`, in the top-level `status_code` or in `tasks[0]`), no task was set and nothing was paid: wait 6 seconds and send it again, as long as the next attempt starts within 60 seconds of the first. A minute outlasts the per-minute limit and still leaves the task about 220 seconds before the deadline. Otherwise, or once that minute is up, return the task_post response verbatim with status `200`: it carries DataForSEO's error (for example `40501` invalid field or `40210` insufficient funds) in `tasks[0].status_code`, like any other task-level error.
 
 **task_get (polling):**
 1. Wait 10 seconds after the task is set, then request the result.
@@ -547,7 +548,7 @@ The Worker reads only the task ID and status codes. It does not validate or tran
 
 **Timing.** DataForSEO says `resolve_goto_urls` adds up to 40 seconds to a high-priority task, for a turnaround of at most 260 seconds. `resolve_poisoned_results` adds one Google request to every task; DataForSEO gives no time figure for it. In testing (`"best running shoes"`, US, depth 10), requests took 145 to 186 seconds end to end: 145 and 163 s on `wrangler dev`, 170 and 157 s on the staging Worker, and 186 and 162 s in production on 2026-11-25.
 
-**Limits.** The first result request goes out 10 seconds after the task is set, then one every 6 seconds. A result request that has not fully answered within 10 seconds is abandoned and counts as a failure. After 280 seconds the Worker stops and returns `504` `dataforseo_timeout` with the task ID. The task_post request has no time limit of its own, because abandoning it could leave a paid task whose ID nobody has; Cloudflare's 125-second cutoff bounds it. That is at most 47 outbound requests per call (one task_post and up to 46 task_get), within the 50 subrequests per invocation that Workers Free allows. Both limits are checked when the code compiles.
+**Limits.** The first result request goes out 10 seconds after the task is set, then one every 6 seconds. A result request that has not fully answered within 10 seconds is abandoned and counts as a failure. After 280 seconds the Worker stops and returns `504` `dataforseo_timeout` with the task ID. The task_post request has no time limit of its own, because abandoning it could leave a paid task whose ID nobody has; Cloudflare's 125-second cutoff bounds it, and a rate-limited task_post is sent again only within the first 60 seconds, so even a resent one ends by about 185 seconds. Every outbound request starts at least 6 seconds after the one before, and none starts after 280 seconds, so one call makes at most 47 (task_post, any resends, and task_get), within the 50 subrequests per invocation that Workers Free allows. These limits are checked when the code compiles.
 
 **What actually happens in each scenario:**
 
@@ -916,14 +917,23 @@ const POLL_INTERVAL_MS: u64 = 6_000; // between result requests
 const DEADLINE_MS: u64 = 280_000; // overall limit, from just before task_post
 const POLL_TIMEOUT_MS: u32 = 10_000; // longest wait for one result request, body included
 const MAX_POLL_FAILURES: u32 = 3; // failed result requests in a row
-const MAX_SUBREQUESTS: u64 = 1 + (DEADLINE_MS - FIRST_POLL_AFTER_MS) / POLL_INTERVAL_MS + 1;
+const POST_RETRY_WINDOW_MS: u64 = 60_000; // resending a rate-limited task_post, every POLL_INTERVAL_MS
+const CLOUDFLARE_CUTOFF_MS: u64 = 125_000; // outbound request whose server sends nothing
+// Each outbound request starts at least POLL_INTERVAL_MS after the one before,
+// and none starts after the deadline.
+const MAX_SUBREQUESTS: u64 = 1 + DEADLINE_MS / POLL_INTERVAL_MS;
 
 // Checked when compiling: Workers Free allows 50 subrequests per invocation,
-// and the Worker's answer (at worst, one result request that starts at the
-// deadline and times out) must come at least 10 seconds before the 300-second
-// client timeout, leaving time for the request's travel and the download.
+// and the Worker's answer must come at least 10 seconds before the 300-second
+// client timeout, leaving time for the request's travel and the download. At
+// worst that answer follows one result request that starts at the deadline and
+// times out, or a task_post that starts at the end of its retry window and
+// runs into Cloudflare's cutoff.
+const _: () = assert!(FIRST_POLL_AFTER_MS >= POLL_INTERVAL_MS);
+const _: () = assert!(POST_RETRY_WINDOW_MS <= DEADLINE_MS);
 const _: () = assert!(MAX_SUBREQUESTS <= 50);
 const _: () = assert!(DEADLINE_MS + POLL_TIMEOUT_MS as u64 <= 290_000);
+const _: () = assert!(POST_RETRY_WINDOW_MS + CLOUDFLARE_CUTOFF_MS <= 290_000);
 
 const TASK_CREATED: i64 = 20100;
 const PENDING_STATUS_CODES: [i64; 2] = [40601, 40602]; // Task Handed, Task In Queue
@@ -952,6 +962,10 @@ fn build_payload(request: &SerpRequest) -> serde_json::Value
 
 /// tasks[0].id from a task_post response, only if tasks[0].status_code is 20100.
 fn created_task_id(body: &serde_json::Value) -> Option<&str>
+
+/// Whether a task_post response created no task and is_busy: DataForSEO's rate
+/// limits turned it away, so it can be sent again without paying twice.
+fn post_is_busy(body: &serde_json::Value) -> bool
 
 /// The task_get/advanced URL for the task, with `.ai` when ai_optimized is set.
 /// None unless the ID is a 36-character UUID (hex digits and dashes).
@@ -1012,23 +1026,34 @@ pub async fn fetch_serp(
     let encoded = base64::engine::general_purpose::STANDARD.encode(credentials.as_bytes());
     let auth_header = format!("Basic {}", encoded);
 
-    // 1. Set the task.
+    // 1. Set the task. A task_post turned away by a rate limit set no task and
+    //    cost nothing, so it is sent again for up to POST_RETRY_WINDOW_MS.
     let started_ms = Date::now().as_millis();
     let payload = build_payload(request).to_string();
-    // No time limit: abandoning task_post could leave a paid task without its ID.
-    let (status, post_text) = send(
-        TASK_POST_URL,
-        Method::Post,
-        &auth_header,
-        Some(payload),
-        None,
-    )
-    .await?;
-    if !(200..300).contains(&status) {
-        return Err(dataforseo_error(status, &post_text, None).unwrap());
-    }
-    let post_body: serde_json::Value = serde_json::from_str(&post_text)
-        .map_err(|_| dataforseo_error(status, &post_text, None).unwrap())?;
+    let (status, post_text, post_body) = loop {
+        // No time limit: abandoning task_post could leave a paid task without its ID.
+        let (status, post_text) = send(
+            TASK_POST_URL,
+            Method::Post,
+            &auth_header,
+            Some(payload.clone()),
+            None,
+        )
+        .await?;
+        if !(200..300).contains(&status) {
+            return Err(dataforseo_error(status, &post_text, None).unwrap());
+        }
+        let post_body: serde_json::Value = serde_json::from_str(&post_text)
+            .map_err(|_| dataforseo_error(status, &post_text, None).unwrap())?;
+
+        let elapsed_ms = Date::now().as_millis().saturating_sub(started_ms);
+        let send_again =
+            post_is_busy(&post_body) && elapsed_ms + POLL_INTERVAL_MS <= POST_RETRY_WINDOW_MS;
+        if !send_again {
+            break (status, post_text, post_body);
+        }
+        Delay::from(Duration::from_millis(POLL_INTERVAL_MS)).await;
+    };
 
     // 2. A task that was not created carries DataForSEO's error: pass it through.
     let Some(task_id) = created_task_id(&post_body) else {
@@ -1063,7 +1088,7 @@ pub async fn fetch_serp(
 }
 ```
 
-**Unit tests** (native, `cargo test`): the task_post body (priority and the three flags, for both formats and both location types), reading the task ID only from a created task, task_get URLs for both formats and rejection of non-UUID IDs, the pending check for both formats, the server-error check (top-level only), the rate-limit check (top level and `tasks[0]`), recognizing timeout messages whether the headers or the body were late, and reading status codes from a full result while rejecting a non-JSON body.
+**Unit tests** (native, `cargo test`): the task_post body (priority and the three flags, for both formats and both location types), reading the task ID only from a created task, resending only a rate-limited task_post, task_get URLs for both formats and rejection of non-UUID IDs, the pending check for both formats, the server-error check (top-level only), the rate-limit check (top level and `tasks[0]`), recognizing timeout messages whether the headers or the body were late, and reading status codes from a full result while rejecting a non-JSON body.
 
 **Security notes:**
 - The `login` and `password` are never logged or included in error responses.
@@ -1181,7 +1206,7 @@ fn truncate(s: &str, max_bytes: usize) -> &str {
 ### 7.4 Known Limitations
 
 - **csvkey in URL**: The `csvkey` appears in the URL query string, which may be logged by intermediary proxies or in Cloudflare access logs. This is an accepted trade-off for consistency with the existing tool ecosystem (rusty-gateway, edgentities). Agents should use HTTPS exclusively.
-- **No rate limiting**: The Worker does not implement its own rate limiting. It relies on DataForSEO's built-in rate limits (per DataForSEO's errors appendix in November 2026: 10,000 requests per minute and 30 simultaneous requests, for the whole account). Polling adds at most 46 short result requests per call; if a limit turns one away, the Worker asks again (Section 4.5). A compromised csvkey could exhaust the DataForSEO account balance.
+- **No rate limiting**: The Worker does not implement its own rate limiting. It relies on DataForSEO's built-in rate limits (per DataForSEO's errors appendix in November 2026: 10,000 requests per minute and 30 simultaneous requests, for the whole account). Polling adds at most 46 short result requests per call. If a limit turns a result request away, the Worker asks again; if it turns task_post away, the Worker sends it again for up to a minute (Section 4.5). A compromised csvkey could exhaust the DataForSEO account balance.
 - **Single csvkey**: The Worker supports one csvkey per environment. Multiple keys (comma-separated, like edgentities) can be added as a future enhancement if needed.
 
 ---
@@ -1512,7 +1537,7 @@ For complete item schemas, refer to the [DataForSEO SERP API documentation](http
 | `40100` | Not authorized | Check DATAFORSEO_LOGIN/PASSWORD secrets |
 | `40102` | No search results | Return empty to user (valid query, no results) |
 | `40200` | Payment required | Alert operator, DataForSEO balance depleted |
-| `40202` | Rate limit exceeded | From task_post: retry after delay (no task was set). Never seen from a result request: the Worker waits and asks again |
+| `40202` | Rate limit exceeded | From task_post, the Worker sends it again every 6 seconds for up to a minute (no task was set, nothing paid); if it is still turned away, the response is passed through: retry later. Never seen from a result request: the Worker waits and asks again |
 | `40209` | Too many simultaneous requests (more than 30) | Same as `40202` |
 | `40210` | Insufficient funds | Alert operator, DataForSEO balance too low |
 | `40501` | Invalid field | Check request construction |
