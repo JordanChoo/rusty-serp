@@ -1,6 +1,6 @@
 # rusty-serp
 
-A Rust-based Cloudflare Worker that serves as a stateless HTTP proxy to the [DataForSEO](https://dataforseo.com/) SERP Google Organic Live Advanced API. It provides a unified, authenticated endpoint that Graph Agents call as a tool to retrieve live Google SERP data, including AI Overviews, organic results, People Also Ask, and related searches.
+A Rust-based Cloudflare Worker that serves as a stateless HTTP proxy to the [DataForSEO](https://dataforseo.com/) SERP Google Organic Advanced API. It provides a unified, authenticated endpoint that Graph Agents call as a tool to retrieve live Google SERP data, including AI Overviews, organic results, People Also Ask, and related searches.
 
 ## Why rusty-serp Exists
 
@@ -23,12 +23,16 @@ rusty-serp centralizes all of this behind a single HTTP endpoint. Agents send a 
 |   Deep Agents)   |                                       +------+------+
 |                  |                                              |
 +------------------+                                              |
-                                                                  | POST (Basic Auth)
+                                                                  | 1. POST task_post
+                                                                  | 2. GET task_get every 6 s
+                                                                  |    until the task is done
+                                                                  | (Basic Auth)
                                                                   v
                                                     +----------------------------+
                                                     |        DataForSEO          |
                                                     | /v3/serp/google/organic/   |
-                                                    |   live/advanced[.ai]       |
+                                                    |   task_post                |
+                                                    |   task_get/advanced[.ai]   |
                                                     +----------------------------+
 ```
 
@@ -37,9 +41,15 @@ rusty-serp centralizes all of this behind a single HTTP endpoint. Agents send a 
 1. Agent sends `POST /v1/serp?csvkey=<key>` with a JSON body
 2. Worker validates the csvkey via constant-time comparison
 3. Worker parses and validates the request body (keyword, location, depth, device, language, ai_optimized)
-4. Worker constructs the DataForSEO request with Basic Auth and always sets `load_async_ai_overview: true`, `resolve_goto_urls: true` and `resolve_poisoned_results: true`
-5. Worker selects the standard or AI-optimized endpoint based on the `ai_optimized` flag
-6. Worker returns the DataForSEO response verbatim, without transformation or filtering
+4. Worker sets a high-priority DataForSEO task (`task_post` with `priority: 2`), with Basic Auth, and always sets `load_async_ai_overview: true`, `resolve_goto_urls: true` and `resolve_poisoned_results: true`
+5. Worker asks `task_get/advanced` for the result 10 seconds later and then every 6 seconds until the task is done. With `ai_optimized: true` it asks `task_get/advanced/{id}.ai` instead
+6. Worker returns the finished task's response verbatim, without transformation or filtering
+
+### Why the Worker Polls
+
+Cloudflare ends a Worker's outbound request with a `524` error when the server sends nothing for 125 seconds (its [Proxy Read Timeout](https://developers.cloudflare.com/fundamentals/reference/connection-limits/), which only Enterprise zones can raise). With redirect resolution and the poisoned-result check always on, DataForSEO needs longer than that, so a single Live request was cut off. Instead, the Worker sets a task and polls for it, and every one of those requests returns at once. Only the Worker's answer to its caller takes long, and Cloudflare doesn't cut that off: a test Worker answered after 200 seconds.
+
+The Worker gives up after 280 seconds and answers `504` with code `dataforseo_timeout`. One call makes at most 47 requests to DataForSEO, within the 50 that the Workers Free plan allows.
 
 ### Module Structure
 
@@ -47,7 +57,7 @@ rusty-serp centralizes all of this behind a single HTTP endpoint. Agents send a 
 src/
   lib.rs           # Entry point, routing, orchestration
   validation.rs    # csvkey auth, JSON body parsing, field validation
-  dataforseo.rs    # DataForSEO API client (request build, fetch, response handling)
+  dataforseo.rs    # DataForSEO API client (task_post, polling task_get, response handling)
   errors.rs        # JSON error response builders, UTF-8-safe truncation
 ```
 
@@ -141,7 +151,9 @@ curl -X POST "https://rusty-serp.example.com/v1/serp?csvkey=your-secret-key" \
 
 **Response:** `200 OK` with DataForSEO response body passed through verbatim. The HTTP status is always `200` for successful upstream calls; check the `status_code` field in the JSON body for DataForSEO-level success or failure (`20000` = success).
 
-**Result URLs:** rusty-serp always sends `resolve_goto_urls: true`, so DataForSEO replaces Google's redirect ("goto") links in the results with the final destination URLs. In testing, that covered both `url` fields and links inside `markdown` text. A redirect DataForSEO cannot resolve is returned unchanged. Callers cannot turn this off. It makes requests slower: DataForSEO can take up to 260 seconds to respond.
+The body is DataForSEO's `task_get/advanced` response for the finished task (`task_get/advanced/{id}.ai` with `ai_optimized: true`). It has the same shape as a Live response, with three differences in the standard format: `time` is how long the result request took, not the search; `path` names `task_get` and ends with the task ID; and `data` also echoes `priority`. `cost` is the task's full cost. If DataForSEO doesn't create the task at all (for example, an invalid field or an empty balance), the `task_post` response is returned instead, with the error in `tasks[0].status_code`. That response is in the standard format even when `ai_optimized` is `true`.
+
+**Result URLs:** rusty-serp always sends `resolve_goto_urls: true`, so DataForSEO replaces Google's redirect ("goto") links in the results with the final destination URLs. In testing, that covered both `url` fields and links inside `markdown` text. A redirect DataForSEO cannot resolve is returned unchanged. Callers cannot turn this off. It makes requests slower: DataForSEO says it adds up to 40 seconds to a high-priority task, for a turnaround of at most 260 seconds.
 
 **Organic results:** rusty-serp always sends `resolve_poisoned_results: true`. Google sometimes answers automated requests with a "poisoned" page that looks normal but has most organic listings swapped for unrelated ones. DataForSEO checks the first results page against Google's Web view. If the page looks poisoned, it replaces the affected organic results with the verified ones, appends any extra listings the Web view has, and collects any further pages (`depth` above 10) from the Web view as well. Each replaced or added result has `from_web` in its `checks` array, in both response formats. AI Overviews and other SERP features on the first page are returned as collected. Callers cannot turn this off. Every request is charged for one extra SERP page, even when nothing was poisoned, and waits for one extra Google request.
 
@@ -173,8 +185,8 @@ All errors return a consistent JSON shape:
 | 404 | `not_found` | Unrecognized path |
 | 405 | `method_not_allowed` | Wrong HTTP method for the path |
 | 500 | `missing_config` | Server secret not configured |
-| 502 | `dataforseo_error` | DataForSEO returned non-2xx or fetch failed |
-| 504 | `dataforseo_timeout` | Fetch-level timeout detected |
+| 502 | `dataforseo_error` | DataForSEO returned non-2xx or fetch failed (for a result request: three times in a row) |
+| 504 | `dataforseo_timeout` | The task did not finish within 280 seconds (the body adds `dataforseo_task_id`), or a fetch-level timeout |
 
 **DataForSEO errors** include additional context:
 
@@ -249,9 +261,9 @@ serp_tool = Tool(
 
 - **Use `ai_optimized: true` by default** when agents consume SERP data for analysis. The flat structure with stripped null fields reduces token usage significantly.
 - **Use `ai_optimized: false`** when agents need full metadata (rectangles, XPath, position data, cost breakdown).
-- **Set `depth` conservatively.** Start with `10` (default). Each additional 10 results adds ~$0.002.
+- **Set `depth` conservatively.** Start with `10` (default). Each additional 10 results adds ~$0.0012.
 - **Check `status_code` in the response body.** A `200` HTTP response does not guarantee SERP success; look for `20000` in the JSON.
-- **Set agent tool timeout to 300 seconds.** Redirect resolution and the poisoned-result check are always on. DataForSEO caps redirect resolution at 260 seconds in total and gives no time figure for the check; in testing with both on, requests took 105 to 140 seconds.
+- **Set agent tool timeout to 300 seconds.** Redirect resolution and the poisoned-result check are always on. DataForSEO caps redirect resolution at 260 seconds in total and gives no time figure for the check; in testing, requests took 145 to 170 seconds. The Worker gives up at 280 seconds and answers `504`, so a 300-second client timeout always gets an answer from the Worker.
 - **Handle non-JSON errors.** If the Worker throws an exception or the connection drops, agents receive a Cloudflare HTML error page or a connection reset, not a JSON response.
 
 ## Common Location Codes
@@ -349,15 +361,19 @@ To roll back a deployment, navigate to **Workers & Pages > rusty-serp > Deployme
 
 ## Cost Reference
 
+rusty-serp uses DataForSEO's Standard method at high priority (`priority: 2`), which is charged when the task is set. Fetching the result is free.
+
 | Scenario | DataForSEO Cost |
 |----------|----------------|
-| Basic query, 10 results | **$0.006** ($0.002 base + $0.002 AI overview + $0.002 poisoned-result check) |
-| Basic query, 20 results | **$0.008** ($0.004 for 2 pages + $0.002 AI overview + $0.002 poisoned-result check) |
+| Basic query, 10 results | **$0.003** ($0.0012 base + $0.0006 AI overview + $0.0012 poisoned-result check) |
+| Basic query, 20 results | **$0.0042** ($0.0024 for 2 pages + $0.0006 AI overview + $0.0012 poisoned-result check) |
 | AI overview absent/cached | AI overview surcharge refunded |
 | Query with search operators | Base cost x5 |
-| `.ai` endpoint (AI-optimized) | No additional cost |
+| `.ai` format (AI-optimized) | No additional cost |
 | Redirect resolution (`resolve_goto_urls`, always on) | No extra charge listed by DataForSEO |
-| Poisoned-result check (`resolve_poisoned_results`, always on) | Price of one more SERP page ($0.002 for Live) per request, whatever the depth and whether or not anything was poisoned |
+| Poisoned-result check (`resolve_poisoned_results`, always on) | Price of one more SERP page ($0.0012 at high priority) per request, whatever the depth and whether or not anything was poisoned |
+
+In testing, a 10-result query cost $0.0024 with the AI overview surcharge refunded: two pages at $0.0012, one of them for the poisoned-result check.
 
 ## Dependencies
 

@@ -4,7 +4,7 @@
 
 ### 1.1 Purpose
 
-rusty-serp is a Rust-based Cloudflare Worker that serves as a stateless HTTP proxy to the DataForSEO SERP Google Organic Live Advanced API. It provides a unified, authenticated endpoint that Graph Agents (LangGraph, LangChain, Deep Agents, and similar orchestration frameworks) call as a tool to retrieve live Google SERP data.
+rusty-serp is a Rust-based Cloudflare Worker that serves as a stateless HTTP proxy to the DataForSEO SERP Google Organic Advanced API. It provides a unified, authenticated endpoint that Graph Agents (LangGraph, LangChain, Deep Agents, and similar orchestration frameworks) call as a tool to retrieve live Google SERP data.
 
 ### 1.2 Problem Statement
 
@@ -26,8 +26,8 @@ Adapted from the architecture patterns established in [rusty-gateway](https://gi
 **In scope:**
 - Accept SERP query parameters via POST JSON body
 - Authenticate callers via `csvkey` query parameter
-- Construct and execute DataForSEO SERP API requests
-- Route to standard or AI-optimized (`.ai`) endpoint based on `ai_optimized` flag
+- Set one high-priority DataForSEO task per request (`task_post`) and poll for its result (`task_get/advanced`) within the same request (Section 4.6 explains why)
+- Fetch the result in the standard or AI-optimized (`.ai`) format based on the `ai_optimized` flag
 - Always set `load_async_ai_overview: true` in outbound requests
 - Always set `resolve_goto_urls: true` in outbound requests
 - Always set `resolve_poisoned_results: true` in outbound requests
@@ -38,7 +38,7 @@ Adapted from the architecture patterns established in [rusty-gateway](https://gi
 - Response caching (no KV, no Cache API)
 - Response transformation or filtering
 - Rate limiting (rely on DataForSEO's built-in limits)
-- Batch/queue task mode (Live mode only)
+- Batches of tasks, normal-priority tasks, and asynchronous delivery to the caller (pingbacks, postbacks, or a task ID to collect later): every request is answered with its own result
 - Non-Google search engines
 - Non-organic SERP types (maps, news, images as primary)
 
@@ -57,13 +57,16 @@ Adapted from the architecture patterns established in [rusty-gateway](https://gi
 |   Deep Agents)   |                                       +------+------+
 |                  |                                              |
 +------------------+                                              |
-                                                                  | POST (Basic Auth)
-                                                                  |
+                                                                  | 1. POST task_post
+                                                                  | 2. GET task_get every 6 s
+                                                                  |    until the task is done
+                                                                  | (Basic Auth)
                                                                   v
                                                     +----------------------------+
                                                     |        DataForSEO          |
                                                     | /v3/serp/google/organic/   |
-                                                    |   live/advanced[.ai]       |
+                                                    |   task_post                |
+                                                    |   task_get/advanced[.ai]   |
                                                     +----------------------------+
 ```
 
@@ -89,13 +92,17 @@ Adapted from the architecture patterns established in [rusty-gateway](https://gi
    - language: optional, non-empty string, default "en"
    - ai_optimized: optional, must be boolean if present, default false
 9. Worker reads DATAFORSEO_LOGIN and DATAFORSEO_PASSWORD from environment (reject missing with 500)
-10. Worker constructs DataForSEO request body (always sets load_async_ai_overview: true, resolve_goto_urls: true and resolve_poisoned_results: true)
-11. Worker determines endpoint URL:
-    - ai_optimized == true  -> .../live/advanced.ai
-    - ai_optimized == false -> .../live/advanced
-12. Worker sends POST to DataForSEO with Basic Auth
-13. Worker reads DataForSEO response
-14. Worker returns DataForSEO response body verbatim with status 200 (or 502/504 on failure)
+10. Worker constructs the task_post body (priority: 2; always sets load_async_ai_overview: true, resolve_goto_urls: true and resolve_poisoned_results: true)
+11. Worker sends POST to .../task_post with Basic Auth
+    - non-2xx or unreadable response -> 502
+    - task not created (tasks[0].status_code != 20100) -> return the task_post response verbatim with status 200
+12. Worker waits 10 s, then sends GET with Basic Auth to the result URL:
+    - ai_optimized == true  -> .../task_get/advanced/{id}.ai
+    - ai_optimized == false -> .../task_get/advanced/{id}
+13. Task status 40601 (Task Handed) or 40602 (Task In Queue) -> wait 6 s and repeat step 12
+    - a failed result request is retried the same way; the third failure in a row -> 502
+    - no answer within 280 s of step 11 -> 504 dataforseo_timeout with dataforseo_task_id
+14. Worker returns the finished task's response body verbatim with status 200
 ```
 
 ### 2.3 Module Structure
@@ -112,7 +119,7 @@ rusty-serp/
   src/
     lib.rs                   # Entry point, routing, orchestration
     validation.rs            # Request body parsing, field validation, csvkey auth
-    dataforseo.rs            # DataForSEO API client (request construction, fetch, response handling)
+    dataforseo.rs            # DataForSEO API client (task_post, polling task_get, response handling)
     errors.rs                # JSON error response builders
 ```
 
@@ -122,8 +129,8 @@ rusty-serp/
 |--------|---------------|-------------|
 | `lib.rs` | `#[event(fetch)]` entry point, HTTP method check, orchestrates validation -> dataforseo call chain | `validation`, `dataforseo`, `errors` |
 | `validation.rs` | Parses `csvkey` from query params, reads and validates JSON body, performs constant-time auth comparison, validates all input fields | `errors` |
-| `dataforseo.rs` | Constructs DataForSEO request body (always setting `load_async_ai_overview`, `resolve_goto_urls` and `resolve_poisoned_results` to `true`), builds Basic Auth header, selects endpoint URL, executes fetch, handles HTTP-level errors | `errors` |
-| `errors.rs` | Provides `json_error()` and `dataforseo_error()` response builder functions, UTF-8-safe body truncation | (none) |
+| `dataforseo.rs` | Constructs the task_post body (`priority: 2`, always setting `load_async_ai_overview`, `resolve_goto_urls` and `resolve_poisoned_results` to `true`), builds Basic Auth header, sets the task, polls `task_get/advanced` (or `.ai`) until the task is done or the deadline passes, handles HTTP-level errors | `errors` |
+| `errors.rs` | Provides `json_error()`, `dataforseo_error()` and `task_timeout_error()` response builder functions, UTF-8-safe body truncation | (none) |
 
 ---
 
@@ -249,17 +256,17 @@ This applies defaults: `depth: 10`, `device: "desktop"`, `language: "en"`, `ai_o
 
 #### 3.4.1 Success Response (Pass-Through)
 
-The Worker returns the DataForSEO response body verbatim. The response shape depends on the `ai_optimized` flag:
+The Worker returns the DataForSEO response body verbatim: the `task_get/advanced` response for the finished task (Section 4.1). The response shape depends on the `ai_optimized` flag. In the standard format, `time` is how long the result request took (not the search), `path` names `task_get` and ends with the task ID, `data` echoes the task_post parameters including `priority`, and `cost` is the task's full cost.
 
 **When `ai_optimized: false` (standard response):**
 
 ```json
 {
-  "version": "0.1.20250520",
+  "version": "0.1.20261117",
   "status_code": 20000,
   "status_message": "Ok.",
-  "time": "112.4521 sec.",
-  "cost": 0.008,
+  "time": "0.0314 sec.",
+  "cost": 0.0042,
   "tasks_count": 1,
   "tasks_error": 0,
   "tasks": [
@@ -267,20 +274,22 @@ The Worker returns the DataForSEO response body verbatim. The response shape dep
       "id": "05281810-1535-0121-0000-014aadae6b3a",
       "status_code": 20000,
       "status_message": "Ok.",
-      "time": "112.3810 sec.",
-      "cost": 0.008,
+      "time": "0.0276 sec.",
+      "cost": 0.0042,
       "result_count": 1,
-      "path": ["v3", "serp", "google", "organic", "live", "advanced"],
+      "path": ["v3", "serp", "google", "organic", "task_get", "advanced", "05281810-1535-0121-0000-014aadae6b3a"],
       "data": {
         "api": "serp",
-        "function": "live",
+        "function": "task_get",
         "se": "google",
         "se_type": "organic",
         "keyword": "best project management tools 2026",
         "location_code": 2840,
         "language_code": "en",
         "device": "desktop",
+        "os": "windows",
         "depth": 20,
+        "priority": 2,
         "load_async_ai_overview": true,
         "resolve_goto_urls": true,
         "resolve_poisoned_results": true
@@ -374,7 +383,9 @@ The Worker returns the DataForSEO response body verbatim. The response shape dep
 }
 ```
 
-Note: The AI-optimized format strips `null`/`false`/empty fields, removes `position` and `xpath`, flattens the envelope, and rounds floats to 3 decimal places. This is handled entirely by DataForSEO's `.ai` endpoint — the Worker passes it through unchanged.
+Note: The AI-optimized format strips `null`/`false`/empty fields, removes `position` and `xpath`, flattens the envelope, and rounds floats to 3 decimal places. This is handled entirely by DataForSEO's `.ai` format of `task_get/advanced` — the Worker passes it through unchanged. It has the same fields as the `.ai` format of the Live endpoint.
+
+**Task not created:** If DataForSEO does not create the task (for example, an invalid field or an empty balance), the Worker returns the `task_post` response instead, verbatim, with the error in `tasks[0].status_code`. That response uses the standard envelope even when `ai_optimized` is `true`, because `task_post` has no `.ai` format.
 
 **HTTP Status:** The Worker returns `200` for all successful DataForSEO responses, regardless of the DataForSEO task-level `status_code`. The caller inspects the `status_code` field in the JSON body to determine DataForSEO-level success or failure.
 
@@ -412,8 +423,8 @@ All error responses follow a consistent JSON schema:
 | 404 | `not_found` | Unrecognized path |
 | 405 | `method_not_allowed` | Non-POST method on `/v1/serp`, non-GET/HEAD on `/v1/health` |
 | 500 | `missing_config` | `CSVKEY`, `DATAFORSEO_LOGIN`, or `DATAFORSEO_PASSWORD` secret is not configured |
-| 502 | `dataforseo_error` | DataForSEO returned an HTTP error (non-2xx status), **or** the outbound fetch to DataForSEO failed entirely (network error, DNS failure, TLS error). When the fetch never reached DataForSEO, the response will have `"dataforseo_status": 0` — this tells the caller the failure was at the network level, not a DataForSEO HTTP error. |
-| 504 | `dataforseo_timeout` | The outbound fetch to DataForSEO failed with an error whose message contains "timeout" or "timed out". **Important implementation note:** Cloudflare Workers do not support `tokio::time::timeout` or similar async timeouts, and Cloudflare sets no time limit on the fetch while the caller stays connected. This code therefore only appears if the runtime itself reports a timeout, which should be rare. If the caller's own timeout fires first, the caller gets no response at all (see Section 4.6). |
+| 502 | `dataforseo_error` | DataForSEO returned an HTTP error (non-2xx status) or a body that is not JSON, **or** the outbound fetch to DataForSEO failed entirely (network error, DNS failure, TLS error). For the task_post request this happens on the first failure; result requests are retried, and the third failure in a row is returned. When the fetch never reached DataForSEO, the response will have `"dataforseo_status": 0` — this tells the caller the failure was at the network level, not a DataForSEO HTTP error. |
+| 504 | `dataforseo_timeout` | The task did not finish within 280 seconds of being set. The body adds `"dataforseo_task_id"`; DataForSEO may still finish the task and charge for it. The same code is returned when an outbound fetch fails with an error whose message contains "timeout" or "timed out", which should be rare. If the caller's own timeout fires first, the caller gets no response at all (see Section 4.6). |
 
 #### 3.4.4 DataForSEO Error Response
 
@@ -449,10 +460,15 @@ A `dataforseo_status` of `0` means the request never reached DataForSEO — it i
 
 ### 4.1 Endpoint Selection
 
-| `ai_optimized` Value | DataForSEO Endpoint |
-|----------------------|-------------------|
-| `false` (default) | `https://api.dataforseo.com/v3/serp/google/organic/live/advanced` |
-| `true` | `https://api.dataforseo.com/v3/serp/google/organic/live/advanced.ai` |
+The Worker uses DataForSEO's Standard method: it sets a task and then fetches the task's result. Section 4.6 explains why it does not use the Live endpoint.
+
+| Step | `ai_optimized` Value | DataForSEO Endpoint |
+|------|----------------------|-------------------|
+| Set the task | either | `POST https://api.dataforseo.com/v3/serp/google/organic/task_post` |
+| Fetch the result | `false` (default) | `GET https://api.dataforseo.com/v3/serp/google/organic/task_get/advanced/{id}` |
+| Fetch the result | `true` | `GET https://api.dataforseo.com/v3/serp/google/organic/task_get/advanced/{id}.ai` |
+
+`{id}` is the task ID from the task_post response (`tasks[0].id`, given when `tasks[0].status_code` is `20100`, "Task Created."). The Worker only puts it in the URL if it is a 36-character UUID.
 
 ### 4.2 Authentication
 
@@ -466,7 +482,7 @@ The base64 encoding is performed at request time using the `base64` crate. Crede
 
 ### 4.3 Request Construction
 
-The Worker constructs the DataForSEO request body as a JSON array containing a single task object. The following fields are always set:
+The Worker constructs the task_post body as a JSON array containing a single task object. The following fields are always set:
 
 | DataForSEO Field | Source | Notes |
 |-----------------|--------|-------|
@@ -476,8 +492,9 @@ The Worker constructs the DataForSEO request body as a JSON array containing a s
 | `depth` | `request.depth` (default: `10`) | Passed through |
 | `device` | `request.device` (default: `"desktop"`) | Normalized to lowercase |
 | `language_code` | `request.language` (default: `"en"`) | Passed through |
+| `priority` | **Always `2`** | High execution priority. Normal-priority tasks wait in DataForSEO's queue and can take minutes; high-priority tasks start at once and cost more per page (Section 4.7). |
 | `load_async_ai_overview` | **Always `true`** | Hardcoded. Never overridden by caller input. |
-| `resolve_goto_urls` | **Always `true`** | Hardcoded. Never overridden by caller input. DataForSEO replaces Google redirect ("goto") links in the results with final destination URLs and returns unresolvable links unchanged. In testing, that covered both `url` fields and links inside `markdown` text. Adds turnaround time; a request can take up to 260 seconds. |
+| `resolve_goto_urls` | **Always `true`** | Hardcoded. Never overridden by caller input. It must be sent: for high-priority tasks it defaults to `false`. DataForSEO replaces Google redirect ("goto") links in the results with final destination URLs and returns unresolvable links unchanged. In testing, that covered both `url` fields and links inside `markdown` text. DataForSEO says it adds up to 40 seconds to a high-priority task, for a turnaround of at most 260 seconds. |
 | `resolve_poisoned_results` | **Always `true`** | Hardcoded. Never overridden by caller input. DataForSEO checks the first results page against Google's Web view. If the page looks poisoned (organic listings swapped for unrelated ones), it replaces the affected organic results with the verified ones, appends any extra Web-view listings, and collects any further pages (`depth` above 10) from the Web view as well. Each replaced or added result has `from_web` in its `checks` array, in both response formats. Other SERP features on the first page are returned as collected. Every task is charged for one extra SERP page and waits for one extra Google request. Cannot be combined with `udm=web`/`udm=14`, which the Worker never sends. In testing (`"best running shoes"`, US), 9 of the 10 organic results came back marked `from_web`. |
 
 **Example outbound request body:**
@@ -490,6 +507,7 @@ The Worker constructs the DataForSEO request body as a JSON array containing a s
     "depth": 20,
     "device": "desktop",
     "language_code": "en",
+    "priority": 2,
     "load_async_ai_overview": true,
     "resolve_goto_urls": true,
     "resolve_poisoned_results": true
@@ -501,50 +519,63 @@ The Worker constructs the DataForSEO request body as a JSON array containing a s
 
 | Header | Value |
 |--------|-------|
-| `Authorization` | `Basic <base64(login:password)>` |
-| `Content-Type` | `application/json` |
+| `Authorization` | `Basic <base64(login:password)>` (every request) |
+| `Content-Type` | `application/json` (task_post only; the task_get requests have no body) |
 
 ### 4.5 Response Handling
 
+**task_post:**
 1. **Read the response body as text.** This is done regardless of status code to capture error details.
-2. **Check HTTP status code.** If not in the 2xx range, return a `502` `dataforseo_error` response with the upstream status and truncated body.
-3. **If 2xx**, return the response body verbatim as the Worker response with:
-   - Status: `200`
-   - `Content-Type: application/json`
+2. **Check HTTP status code.** If not in the 2xx range, or the body is not JSON, return a `502` `dataforseo_error` response with the upstream status and truncated body.
+3. **Check that the task was created** (`tasks[0].status_code` is `20100`). If not, return the task_post response verbatim with status `200`: it carries DataForSEO's error (for example `40501` invalid field or `40210` insufficient funds) in `tasks[0].status_code`, like any other task-level error.
 
-The Worker does not parse, validate, or transform the DataForSEO response body. It is treated as an opaque JSON string passed through to the caller.
+**task_get (polling):**
+1. Wait 10 seconds after the task is set, then request the result.
+2. A non-2xx status, a body that is not JSON, or a failed fetch counts as a failed request. The Worker retries it at the next interval; the third failure in a row is returned to the caller (`502` `dataforseo_error`, or `504` for a fetch-level timeout).
+3. Read the task's status code: `tasks[0].status_code` in the standard format, the top-level `status_code` in the `.ai` format. `40601` (Task Handed) and `40602` (Task In Queue) mean the task is still running: wait 6 seconds and ask again.
+4. Any other status code, or none, means the task is finished: return the response body verbatim with status `200` and `Content-Type: application/json`. That includes task-level errors such as `40102` (no search results).
+5. If 280 seconds have passed since the task was set, return `504` `dataforseo_timeout` with `dataforseo_task_id` instead of asking again.
+
+The Worker reads only the task ID and status codes. It does not validate or transform the rest of the response; the body is passed through to the caller as received.
 
 ### 4.6 Timeout Handling
 
-DataForSEO's Live mode has a 120-second timeout per task. Because the Worker always sets `resolve_goto_urls: true`, DataForSEO's docs allow a total turnaround of up to 260 seconds. The Worker also always sets `resolve_poisoned_results: true`, which adds one Google request to every task; DataForSEO gives no time figure for it. In testing with both flags on, requests took 105 to 140 seconds. The Worker does not impose its own timeout. It relies on:
-1. DataForSEO's internal 120-second task timeout (status code `50401`)
-2. The caller staying connected. Cloudflare sets no duration limit on HTTP-triggered Workers and no time limit on individual subrequests while the client remains connected, and time spent waiting on DataForSEO does not count toward the Worker's CPU time limit. If the caller disconnects first, Cloudflare may cancel the Worker and the DataForSEO response is lost.
+**Why the Worker does not use the Live endpoint.** Cloudflare ends a Worker's outbound request with a `524` error when the server sends nothing for 125 seconds. This is the Proxy Read Timeout in Cloudflare's [connection limits](https://developers.cloudflare.com/fundamentals/reference/connection-limits/); only Enterprise zones can raise it, and a workers.dev Worker cannot. Cloudflare's Workers limits page says "There is no set time limit on individual subrequests", but that does not hold for a fetch to an external server: in production on 2026-11-25, both Live requests (`"best running shoes"`, US, depth 10) failed after 125.2 seconds with `"dataforseo_status": 524`. With redirect resolution and the poisoned-result check always on, Live requests took 105 to 140 seconds in testing, so many would fail this way. (Under `wrangler dev` the same requests succeed, because they don't pass through Cloudflare's network.)
+
+**How the Worker avoids it.** Every outbound request is short: task_post returns at once, and so does each task_get. Only the Worker's answer to its own caller takes long, and Cloudflare does not cut that off while the caller stays connected: a test Worker on workers.dev answered after 150 and 200 seconds. Time spent waiting on DataForSEO or on a timer does not count toward the Worker's CPU time limit, so this works on any Workers plan.
+
+**Timing.** DataForSEO says `resolve_goto_urls` adds up to 40 seconds to a high-priority task, for a turnaround of at most 260 seconds. `resolve_poisoned_results` adds one Google request to every task; DataForSEO gives no time figure for it. In testing (`"best running shoes"`, US, depth 10), requests took 145 to 170 seconds end to end, on `wrangler dev` and on Cloudflare.
+
+**Limits.** The first result request goes out 10 seconds after the task is set, then one every 6 seconds. After 280 seconds the Worker stops and returns `504` `dataforseo_timeout` with the task ID. That is at most 47 outbound requests per call (one task_post and up to 46 task_get), within the 50 subrequests per invocation that Workers Free allows. Both limits are checked when the code compiles.
 
 **What actually happens in each scenario:**
 
 | Scenario | What the caller sees |
 |----------|---------------------|
-| DataForSEO responds while the caller is still connected | Normal `200` response with DataForSEO's JSON body. If DataForSEO itself timed out, the JSON body will have `status_code: 50401` — the Worker still returns HTTP `200` (pass-through). |
-| The `Fetch` call errors with a message containing "timeout" or "timed out" | The Worker returns a structured `504` JSON response with code `dataforseo_timeout`. This depends on the runtime's error text and should be rare. |
-| The caller's own timeout fires before DataForSEO responds | The caller gets nothing from rusty-serp; its HTTP client reports a timeout. The result is lost. |
+| The task finishes within 280 seconds | Normal `200` response with DataForSEO's JSON body, including task-level errors in its `status_code`. |
+| The task is still running after 280 seconds | A `504` JSON response with code `dataforseo_timeout` and `dataforseo_task_id`. DataForSEO may still finish the task and charge for it. |
+| Three result requests in a row fail | A `502` `dataforseo_error` (or `504` `dataforseo_timeout` for a fetch-level timeout) describing the last failure. |
+| The caller's own timeout fires first | The caller gets nothing from rusty-serp; its HTTP client reports a timeout. Cloudflare may cancel the Worker, and the result is lost, though DataForSEO charged for the task when it was set. |
 | The Worker throws an exception or the connection drops | A non-JSON Cloudflare error page or a connection reset, **not** a structured JSON response. |
 
-**Implication for agents:** Agents calling rusty-serp should handle four outcomes: (1) a `200` with `status_code: 50401` in the body (DataForSEO timeout), (2) a `504` JSON with code `dataforseo_timeout` (rare, fetch-level timeout), (3) their own client timeout, and (4) a non-JSON error page or connection reset. Set agent tool timeout to at least 260 seconds (300 recommended).
-
-**Implication for deployment:** Request duration does not depend on the Workers plan: waiting on DataForSEO is not CPU time, and Cloudflare does not limit how long an HTTP request may run while the caller stays connected.
+**Implication for agents:** Set the agent tool timeout to 300 seconds. The Worker answers by about 286 seconds at the latest (its 280-second deadline plus one result request), so a 300-second timeout always gets the Worker's answer. Agents should handle a `200` with a task-level error in `status_code`, a `504` `dataforseo_timeout`, a `502` `dataforseo_error`, and a non-JSON error page or connection reset.
 
 ### 4.7 Cost Implications
 
+The Standard method is charged when the task is set; fetching the result is free. High priority costs more per page than normal priority, but less than Live.
+
 | Scenario | DataForSEO Cost |
 |----------|----------------|
-| Basic query, 10 results | $0.002 (base) + $0.002 (`load_async_ai_overview`) + $0.002 (`resolve_poisoned_results`) = **$0.006** |
-| Basic query, 20 results | $0.004 (2 pages) + $0.002 + $0.002 = **$0.008** |
+| Basic query, 10 results | $0.0012 (one page at high priority) + $0.0006 (`load_async_ai_overview`) + $0.0012 (`resolve_poisoned_results`) = **$0.003** |
+| Basic query, 20 results | $0.0024 (2 pages) + $0.0006 + $0.0012 = **$0.0042** |
 | AI overview absent from SERP | `load_async_ai_overview` surcharge refunded |
 | AI overview was cached (not async) | `load_async_ai_overview` surcharge refunded |
 | Query with search operators | Base cost x5 |
-| `.ai` suffix (AI-optimized) | No additional cost |
+| `.ai` format (AI-optimized) | No additional cost |
 | `resolve_goto_urls` (always on) | No extra charge listed by DataForSEO |
-| `resolve_poisoned_results` (always on) | Price of one more SERP page ($0.002 for Live) per task, fixed regardless of depth and charged even when nothing was poisoned. In testing, a 10-result Live task cost $0.004 with it, against $0.002 without (the AI overview surcharge was refunded both times). |
+| `resolve_poisoned_results` (always on) | Price of one more SERP page ($0.0012 at high priority) per task, fixed regardless of depth and charged even when nothing was poisoned. |
+
+In testing, a 10-result task cost $0.0024 with the AI overview surcharge refunded: two pages at $0.0012, one of them for the poisoned-result check. The same query on the Live endpoint cost $0.004.
 
 ---
 
@@ -875,24 +906,62 @@ pub async fn parse_and_validate_body(req: &mut Request) -> std::result::Result<S
 **Constants:**
 
 ```rust
-const DATAFORSEO_BASE_URL: &str = "https://api.dataforseo.com/v3/serp/google/organic/live/advanced";
-const DATAFORSEO_AI_URL: &str = "https://api.dataforseo.com/v3/serp/google/organic/live/advanced.ai";
+const TASK_POST_URL: &str = "https://api.dataforseo.com/v3/serp/google/organic/task_post";
+const TASK_GET_URL: &str = "https://api.dataforseo.com/v3/serp/google/organic/task_get/advanced";
+const HIGH_PRIORITY: u8 = 2;
+
+const FIRST_POLL_AFTER_MS: u64 = 10_000; // first result request
+const POLL_INTERVAL_MS: u64 = 6_000; // between result requests
+const DEADLINE_MS: u64 = 280_000; // overall limit, from just before task_post
+const MAX_POLL_FAILURES: u32 = 3; // failed result requests in a row
+const MAX_SUBREQUESTS: u64 = 1 + (DEADLINE_MS - FIRST_POLL_AFTER_MS) / POLL_INTERVAL_MS + 1;
+
+// Checked when compiling: Workers Free allows 50 subrequests per invocation,
+// and the Worker must answer before the 300-second client timeout.
+const _: () = assert!(MAX_SUBREQUESTS <= 50);
+const _: () = assert!(DEADLINE_MS + POLL_INTERVAL_MS < 300_000);
+
+const TASK_CREATED: i64 = 20100;
+const PENDING_STATUS_CODES: [i64; 2] = [40601, 40602]; // Task Handed, Task In Queue
 ```
 
 **Functions:**
 
 ```rust
-/// Construct the DataForSEO request, execute it, and return the response.
-/// Returns the DataForSEO response body as a Worker Response with status 200,
-/// or an Err(Response) with 502/504 on failure.
-pub async fn fetch_serp(
-    request: &SerpRequest,
-    login: &str,
-    password: &str,
-) -> std::result::Result<Response, Response>
+/// The task_post body: one task with priority 2 and the three always-on flags.
+fn build_payload(request: &SerpRequest) -> serde_json::Value
+
+/// tasks[0].id from a task_post response, only if tasks[0].status_code is 20100.
+fn created_task_id(body: &serde_json::Value) -> Option<&str>
+
+/// The task_get/advanced URL for the task, with `.ai` when ai_optimized is set.
+/// None unless the ID is a 36-character UUID (hex digits and dashes).
+fn task_get_url(task_id: &str, ai_optimized: bool) -> Option<String>
+
+/// Whether a task_get response has status 40601 or 40602: tasks[0].status_code
+/// in the standard format, the top-level status_code in the .ai format.
+fn is_pending(body: &serde_json::Value, ai_optimized: bool) -> bool
+
+/// One outbound request; returns the HTTP status and body text. A failed fetch
+/// becomes 502 dataforseo_error (dataforseo_status 0), or 504 dataforseo_timeout
+/// when the error message mentions a timeout.
+async fn send(url: &str, method: Method, auth_header: &str, body: Option<String>)
+    -> std::result::Result<(u16, String), Response>
+
+/// One task_get request: Ok(Some(body)) when finished, Ok(None) while pending,
+/// Err for a non-2xx status, a body that is not JSON, or a failed fetch.
+async fn poll_once(url: &str, auth_header: &str, ai_optimized: bool)
+    -> std::result::Result<Option<String>, Response>
+
+/// Wraps a DataForSEO body, unchanged, in a 200 JSON response.
+fn pass_through(body_text: String) -> std::result::Result<Response, Response>
+
+/// Sets the task, polls for its result, and returns it (or an error response).
+pub async fn fetch_serp(request: &SerpRequest, login: &str, password: &str)
+    -> std::result::Result<Response, Response>
 ```
 
-**Request construction:**
+**`fetch_serp`:**
 
 ```rust
 pub async fn fetch_serp(
@@ -900,90 +969,55 @@ pub async fn fetch_serp(
     login: &str,
     password: &str,
 ) -> std::result::Result<Response, Response> {
-    // 1. Select endpoint URL
-    let url = if request.ai_optimized {
-        DATAFORSEO_AI_URL
-    } else {
-        DATAFORSEO_BASE_URL
-    };
-
-    // 2. Build the task object
-    let mut task = serde_json::json!({
-        "keyword": request.keyword,
-        "depth": request.depth,
-        "device": request.device,
-        "language_code": request.language,
-        "load_async_ai_overview": true,
-        "resolve_goto_urls": true,
-        "resolve_poisoned_results": true,
-    });
-
-    // 3. Set location field based on type
-    match &request.location {
-        Location::Code(code) => {
-            task["location_code"] = serde_json::json!(code);
-        }
-        Location::Name(name) => {
-            task["location_name"] = serde_json::json!(name);
-        }
-    }
-
-    // 4. Wrap in array (DataForSEO expects array of tasks)
-    let payload = serde_json::json!([task]);
-
-    // 5. Build Basic Auth header
     let credentials = format!("{}:{}", login, password);
     let encoded = base64::engine::general_purpose::STANDARD.encode(credentials.as_bytes());
     let auth_header = format!("Basic {}", encoded);
 
-    // 6. Construct outbound request
-    let mut headers = Headers::new();
-    headers.set("Authorization", &auth_header)?;
-    headers.set("Content-Type", "application/json")?;
-
-    let mut init = RequestInit::new();
-    init.with_method(Method::Post)
-        .with_headers(headers)
-        .with_body(Some(payload.to_string().into()));
-
-    let outbound = Request::new_with_init(url, &init)?;
-
-    // 7. Execute fetch
-    // If the fetch itself fails (DNS failure, network error, TLS error, etc.),
-    // we return a 502 with dataforseo_status: 0. The 0 tells callers that the
-    // request never reached DataForSEO — it's not an HTTP status code from them.
-    //
-    // If the error message contains "timeout" or "timed out", we return a 504
-    // with code "dataforseo_timeout" instead. This is the only case where the
-    // Worker can produce a structured 504. Cloudflare sets no time limit on the
-    // fetch, so this only happens if the runtime reports a timeout itself.
-    let mut response = Fetch::Request(outbound).send().await
-        .map_err(|e| {
-            let err_msg = format!("Fetch failed: {}", e);
-            let err_lower = err_msg.to_lowercase();
-            if err_lower.contains("timeout") || err_lower.contains("timed out") {
-                json_error(504, &err_msg, "dataforseo_timeout").unwrap()
-            } else {
-                dataforseo_error(0, &err_msg, None).unwrap()
-            }
-        })?;
-
-    // 8. Read response body
-    let status = response.status_code();
-    let body_text = response.text().await
-        .map_err(|e| dataforseo_error(status, &format!("Failed to read response: {}", e), None).unwrap())?;
-
-    // 9. Check status
-    if !(200..300).contains(&(status as u16)) {
-        return Err(dataforseo_error(status, &body_text, None).unwrap());
+    // 1. Set the task.
+    let started_ms = Date::now().as_millis();
+    let payload = build_payload(request).to_string();
+    let (status, post_text) =
+        send(TASK_POST_URL, Method::Post, &auth_header, Some(payload)).await?;
+    if !(200..300).contains(&status) {
+        return Err(dataforseo_error(status, &post_text, None).unwrap());
     }
+    let post_body: serde_json::Value = serde_json::from_str(&post_text)
+        .map_err(|_| dataforseo_error(status, &post_text, None).unwrap())?;
 
-    // 10. Return DataForSEO response verbatim
-    let mut resp = Response::ok(body_text)?;
-    resp.headers_mut().set("Content-Type", "application/json")?;
-    Ok(resp)
+    // 2. A task that was not created carries DataForSEO's error: pass it through.
+    let Some(task_id) = created_task_id(&post_body) else {
+        return pass_through(post_text);
+    };
+    let Some(task_url) = task_get_url(task_id, request.ai_optimized) else {
+        return Err(dataforseo_error(status, &post_text, None).unwrap());
+    };
+
+    // 3. Poll until the task is finished, three requests in a row fail, or the
+    //    deadline passes. Delay is a timer; waiting is not CPU time.
+    Delay::from(Duration::from_millis(FIRST_POLL_AFTER_MS)).await;
+    let mut failures = 0;
+    loop {
+        match poll_once(&task_url, &auth_header, request.ai_optimized).await {
+            Ok(Some(body_text)) => return pass_through(body_text),
+            Ok(None) => failures = 0,
+            Err(error) => {
+                failures += 1;
+                if failures >= MAX_POLL_FAILURES {
+                    return Err(error);
+                }
+            }
+        }
+
+        let elapsed_ms = Date::now().as_millis().saturating_sub(started_ms);
+        if elapsed_ms + POLL_INTERVAL_MS > DEADLINE_MS {
+            return Err(task_timeout_error(task_id).unwrap());
+        }
+        Delay::from(Duration::from_millis(POLL_INTERVAL_MS)).await;
+    }
 }
 ```
+
+**Unit tests** (native, `cargo test`): the task_post body (priority and the three flags, for both formats and both location types), reading the task ID only from a created task, task_get URLs for both formats and rejection of non-UUID IDs, and the pending check for both formats.
 
 **Security notes:**
 - The `login` and `password` are never logged or included in error responses.
@@ -1009,6 +1043,11 @@ pub fn dataforseo_error(
     dfs_body: &str,
     dfs_error_code: Option<&str>,
 ) -> Result<Response>
+
+/// Build the response for a task that did not finish before the Worker's
+/// deadline (always HTTP 504, code "dataforseo_timeout"). The body adds
+/// "dataforseo_task_id", because DataForSEO may still finish and charge for it.
+pub fn task_timeout_error(task_id: &str) -> Result<Response>
 
 /// Truncate a string to max_bytes at a UTF-8 character boundary.
 fn truncate(s: &str, max_bytes: usize) -> &str
@@ -1152,7 +1191,7 @@ curl -X POST "https://rusty-serp.<domain>/v1/serp?csvkey=wrong" \
 curl -X POST "https://rusty-serp.<domain>/v1/serp?csvkey=your-key" \
   -H "Content-Type: application/json" \
   -d '{"keyword": "rust programming", "location": 2840}'
-# Expected: 200, DataForSEO standard response
+# Expected: 200, DataForSEO standard response, after about 2.5 minutes
 ```
 
 **Valid request (AI-optimized):**
@@ -1160,7 +1199,7 @@ curl -X POST "https://rusty-serp.<domain>/v1/serp?csvkey=your-key" \
 curl -X POST "https://rusty-serp.<domain>/v1/serp?csvkey=your-key" \
   -H "Content-Type: application/json" \
   -d '{"keyword": "rust programming", "location": 2840, "ai_optimized": true}'
-# Expected: 200, DataForSEO AI-optimized response (flat structure)
+# Expected: 200, DataForSEO AI-optimized response (flat structure), after about 2.5 minutes
 ```
 
 **Wrong method:**
@@ -1352,9 +1391,9 @@ serp_tool = Tool(
 
 1. **Use `ai_optimized: true` by default** when the agent is consuming the SERP data for analysis. The flat structure with stripped null fields reduces token usage significantly.
 2. **Use `ai_optimized: false`** when the agent needs full metadata (rectangles, XPath, exact position data, cost breakdown).
-3. **Set `depth` conservatively**. Start with `10` (default). Only increase if the agent explicitly needs more results. Each additional 10 results adds ~$0.002.
+3. **Set `depth` conservatively**. Start with `10` (default). Only increase if the agent explicitly needs more results. Each additional 10 results adds ~$0.0012.
 4. **Handle DataForSEO task-level errors**. A `200` HTTP response does not guarantee SERP success. Always check the `status_code` field in the response body (should be `20000` for success).
-5. **Set appropriate timeouts**. The Worker always turns on redirect resolution (`resolve_goto_urls`), so DataForSEO Live mode can take up to 260 seconds, and the poisoned-result check (`resolve_poisoned_results`) adds one more Google request. Agent tool timeout should be at least 260 seconds (300 recommended).
+5. **Set the agent tool timeout to 300 seconds**. The Worker always turns on redirect resolution (`resolve_goto_urls`), which DataForSEO caps at 260 seconds of turnaround, and the poisoned-result check (`resolve_poisoned_results`), which adds one more Google request. In testing, requests took 145 to 170 seconds. The Worker gives up at 280 seconds and answers `504` `dataforseo_timeout`, so a 300-second timeout always gets the Worker's answer (Section 4.6).
 6. **Handle non-JSON error responses**. If the Worker throws an exception or the connection drops, the agent receives a Cloudflare HTML error page or a connection reset, not a JSON response. Agents must handle this gracefully (see Section 4.6 for details).
 7. **Send `ai_optimized` as a JSON boolean**, not a string. `"ai_optimized": true` is correct. `"ai_optimized": "true"` returns a `400` error.
 
@@ -1377,8 +1416,8 @@ rusty-serp/
   src/
     lib.rs                   # Entry point (#[event(fetch)]), routing (GET/HEAD health, POST serp), orchestration
     validation.rs            # csvkey auth, JSON body parsing, field validation (including ai_optimized type check)
-    dataforseo.rs            # DataForSEO API client (request build, fetch, response handling, timeout detection)
-    errors.rs                # json_error(), dataforseo_error(), truncate()
+    dataforseo.rs            # DataForSEO API client (task_post, polling task_get, response handling, deadline)
+    errors.rs                # json_error(), dataforseo_error(), task_timeout_error(), truncate()
 ```
 
 **Total source files:** 4 Rust files.
@@ -1415,7 +1454,7 @@ The following item types may appear in the `items` array of a DataForSEO SERP re
 | `perspectives` | Perspectives results |
 | `short_videos` | Short-form video results |
 
-For complete item schemas, refer to the [DataForSEO SERP API documentation](https://docs.dataforseo.com/v3/serp/google/organic/live/advanced/).
+For complete item schemas, refer to the [DataForSEO SERP API documentation](https://docs.dataforseo.com/v3/serp/google/organic/task_get/advanced/).
 
 ---
 
@@ -1429,8 +1468,11 @@ For complete item schemas, refer to the [DataForSEO SERP API documentation](http
 | `40200` | Payment required | Alert operator, DataForSEO balance depleted |
 | `40202` | Rate limit exceeded | Retry after delay |
 | `40209` | Too many concurrent requests | Retry after delay |
+| `40210` | Insufficient funds | Alert operator, DataForSEO balance too low |
 | `40501` | Invalid field | Check request construction |
-| `50401` | Timeout (120s) | Retry or reduce depth |
+| `40601` / `40602` | Task handed / in queue | Never seen by agents: the Worker keeps polling while a task has these codes |
+
+The Live endpoint's `50401` (120-second timeout) does not apply: the Worker uses `task_post` and `task_get`, and reports its own deadline as HTTP `504` `dataforseo_timeout` (Section 4.6).
 
 ---
 
