@@ -133,7 +133,7 @@ rusty-serp/
 | `lib.rs` | `#[event(fetch)]` entry point, HTTP method check, orchestrates validation -> dataforseo call chain | `validation`, `dataforseo`, `errors` |
 | `validation.rs` | Parses `csvkey` from query params, reads and validates JSON body, performs constant-time auth comparison, validates all input fields | `errors` |
 | `dataforseo.rs` | Constructs the task_post body (`priority: 2`, always setting `load_async_ai_overview`, `resolve_goto_urls` and `resolve_poisoned_results` to `true`), builds Basic Auth header, sets the task, polls `task_get/advanced` (or `.ai`) until the task is done or the deadline passes, handles HTTP-level errors | `errors` |
-| `errors.rs` | Provides `json_error()`, `dataforseo_error()` and `task_timeout_error()` response builder functions, UTF-8-safe body truncation | (none) |
+| `errors.rs` | Provides `json_error()`, `dataforseo_error()`, `task_timeout_error()` and `rate_limited_error()` response builder functions, UTF-8-safe body truncation | (none) |
 
 ---
 
@@ -1489,7 +1489,7 @@ serp_tool = Tool(
 2. **Use `ai_optimized: false`** when the agent needs full metadata (rectangles, XPath, exact position data, cost breakdown).
 3. **Set `depth` conservatively**. Start with `10` (default). Only increase if the agent explicitly needs more results. Each additional 10 results adds ~$0.0012.
 4. **Handle DataForSEO task-level errors**. A `200` HTTP response does not guarantee SERP success. Always check the `status_code` field in the response body (should be `20000` for success).
-5. **Set the agent tool timeout to 300 seconds**. The Worker always turns on redirect resolution (`resolve_goto_urls`), which DataForSEO caps at 260 seconds of turnaround, and the poisoned-result check (`resolve_poisoned_results`), which adds one more Google request. In testing, requests took 145 to 186 seconds. The Worker gives up at 280 seconds and answers `504` `dataforseo_timeout`, so a 300-second timeout always gets the Worker's answer (Section 4.6).
+5. **Set the agent tool timeout to 300 seconds**. The Worker always turns on redirect resolution (`resolve_goto_urls`), which DataForSEO caps at 260 seconds of turnaround, and the poisoned-result check (`resolve_poisoned_results`), which adds one more Google request. In testing, requests took 145 to 186 seconds. The Worker gives up at 280 seconds and answers `504` `dataforseo_timeout`, and abandons any result request after 10 seconds, so it answers within about 290 seconds and a 300-second timeout always gets the Worker's answer (Section 4.6).
 6. **Retry a `429` later**. `dataforseo_rate_limited` means DataForSEO's rate limits outlasted the Worker's minute of resending task_post. No task was set and nothing was paid, so trying again after a minute or more (the response's `Retry-After`) is safe.
 7. **Handle non-JSON error responses**. If the Worker throws an exception or the connection drops, the agent receives a Cloudflare HTML error page or a connection reset, not a JSON response. Agents must handle this gracefully (see Section 4.6 for details).
 8. **Send `ai_optimized` as a JSON boolean**, not a string. `"ai_optimized": true` is correct. `"ai_optimized": "true"` returns a `400` error.
@@ -1514,7 +1514,7 @@ rusty-serp/
     lib.rs                   # Entry point (#[event(fetch)]), routing (GET/HEAD health, POST serp), orchestration
     validation.rs            # csvkey auth, JSON body parsing, field validation (including ai_optimized type check)
     dataforseo.rs            # DataForSEO API client (task_post, polling task_get, response handling, deadline)
-    errors.rs                # json_error(), dataforseo_error(), task_timeout_error(), truncate()
+    errors.rs                # json_error(), dataforseo_error(), task_timeout_error(), rate_limited_error(), truncate()
 ```
 
 **Total source files:** 4 Rust files.

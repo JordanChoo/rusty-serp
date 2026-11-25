@@ -85,7 +85,7 @@ No partial processing. No "validate everything and return all errors." The first
 
 ### Pass-Through Responses
 
-DataForSEO responses are returned verbatim to the caller. The Worker does not parse, validate, filter, or restructure the response payload. This means agents always get the full, unmodified DataForSEO response, and the Worker never needs to be updated when DataForSEO changes their response schema.
+DataForSEO responses are returned verbatim to the caller. The Worker reads only the task ID and the status codes it needs for polling; it does not validate, filter, or restructure the response payload. This means agents get the full, unmodified DataForSEO response, and the Worker never needs to be updated when DataForSEO changes their response schema.
 
 ### Constant-Time Authentication
 
