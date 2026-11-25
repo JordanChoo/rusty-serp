@@ -263,7 +263,7 @@ serp_tool = Tool(
 - **Use `ai_optimized: false`** when agents need full metadata (rectangles, XPath, position data, cost breakdown).
 - **Set `depth` conservatively.** Start with `10` (default). Each additional 10 results adds ~$0.0012.
 - **Check `status_code` in the response body.** A `200` HTTP response does not guarantee SERP success; look for `20000` in the JSON.
-- **Set agent tool timeout to 300 seconds.** Redirect resolution and the poisoned-result check are always on. DataForSEO caps redirect resolution at 260 seconds in total and gives no time figure for the check; in testing, requests took 145 to 170 seconds. The Worker gives up at 280 seconds and answers `504`, so a 300-second client timeout always gets an answer from the Worker.
+- **Set agent tool timeout to 300 seconds.** Redirect resolution and the poisoned-result check are always on. DataForSEO caps redirect resolution at 260 seconds in total and gives no time figure for the check; in testing, requests took 145 to 186 seconds. The Worker gives up at 280 seconds and answers `504`, so a 300-second client timeout always gets an answer from the Worker.
 - **Handle non-JSON errors.** If the Worker throws an exception or the connection drops, agents receive a Cloudflare HTML error page or a connection reset, not a JSON response.
 
 ## Common Location Codes
