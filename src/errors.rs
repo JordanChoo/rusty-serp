@@ -50,9 +50,10 @@ pub fn task_timeout_error(task_id: &str) -> Result<Response> {
     Ok(resp.with_status(504))
 }
 
-/// DataForSEO's rate limits turned the task away for longer than the Worker
-/// keeps resending it. No task was set and nothing was paid, so the caller can
-/// safely try again later. `dfs_body` is DataForSEO's last task_post response.
+/// DataForSEO's rate limits turned the task_post request away for longer than
+/// the Worker keeps resending it. No task was set and nothing was paid, so the
+/// caller can safely try again later. `dfs_body` is DataForSEO's last task_post
+/// response.
 pub fn rate_limited_error(dfs_body: &str) -> Result<Response> {
     let payload = serde_json::json!({
         "error": "DataForSEO rate limit: no task was set, try again later",

@@ -458,6 +458,16 @@ This mirrors the `brightdata_error` pattern from rusty-gateway: always 502, incl
 
 A `dataforseo_status` of `0` means the request never reached DataForSEO — it is not a real HTTP status code. Agents should treat this as a transient infrastructure error and retry.
 
+**When DataForSEO's rate limits still turn task_post away after the Worker's minute of resending** (Section 4.5), the Worker returns `429` with a `Retry-After: 60` header. No task was set and nothing was paid; `dataforseo_body` holds DataForSEO's last task_post response:
+
+```json
+{
+  "error": "DataForSEO rate limit: no task was set, try again later",
+  "code": "dataforseo_rate_limited",
+  "dataforseo_body": "{\"status_code\":40209,\"status_message\":\"too many simultaneous queries.\", ...}"
+}
+```
+
 ---
 
 ## 4. DataForSEO Integration
@@ -1480,8 +1490,9 @@ serp_tool = Tool(
 3. **Set `depth` conservatively**. Start with `10` (default). Only increase if the agent explicitly needs more results. Each additional 10 results adds ~$0.0012.
 4. **Handle DataForSEO task-level errors**. A `200` HTTP response does not guarantee SERP success. Always check the `status_code` field in the response body (should be `20000` for success).
 5. **Set the agent tool timeout to 300 seconds**. The Worker always turns on redirect resolution (`resolve_goto_urls`), which DataForSEO caps at 260 seconds of turnaround, and the poisoned-result check (`resolve_poisoned_results`), which adds one more Google request. In testing, requests took 145 to 186 seconds. The Worker gives up at 280 seconds and answers `504` `dataforseo_timeout`, so a 300-second timeout always gets the Worker's answer (Section 4.6).
-6. **Handle non-JSON error responses**. If the Worker throws an exception or the connection drops, the agent receives a Cloudflare HTML error page or a connection reset, not a JSON response. Agents must handle this gracefully (see Section 4.6 for details).
-7. **Send `ai_optimized` as a JSON boolean**, not a string. `"ai_optimized": true` is correct. `"ai_optimized": "true"` returns a `400` error.
+6. **Retry a `429` later**. `dataforseo_rate_limited` means DataForSEO's rate limits outlasted the Worker's minute of resending task_post. No task was set and nothing was paid, so trying again after a minute or more (the response's `Retry-After`) is safe.
+7. **Handle non-JSON error responses**. If the Worker throws an exception or the connection drops, the agent receives a Cloudflare HTML error page or a connection reset, not a JSON response. Agents must handle this gracefully (see Section 4.6 for details).
+8. **Send `ai_optimized` as a JSON boolean**, not a string. `"ai_optimized": true` is correct. `"ai_optimized": "true"` returns a `400` error.
 
 ---
 
