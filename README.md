@@ -251,7 +251,7 @@ serp_tool = Tool(
 - **Use `ai_optimized: false`** when agents need full metadata (rectangles, XPath, position data, cost breakdown).
 - **Set `depth` conservatively.** Start with `10` (default). Each additional 10 results adds ~$0.002.
 - **Check `status_code` in the response body.** A `200` HTTP response does not guarantee SERP success; look for `20000` in the JSON.
-- **Set agent tool timeout to 300 seconds.** Redirect resolution and the poisoned-result check are always on. DataForSEO caps redirect resolution at 260 seconds in total and gives no time figure for the check; in testing, requests took 85 to 140 seconds.
+- **Set agent tool timeout to 300 seconds.** Redirect resolution and the poisoned-result check are always on. DataForSEO caps redirect resolution at 260 seconds in total and gives no time figure for the check; in testing with both on, requests took 105 to 140 seconds.
 - **Handle non-JSON errors.** If the Worker throws an exception or the connection drops, agents receive a Cloudflare HTML error page or a connection reset, not a JSON response.
 
 ## Common Location Codes
@@ -333,7 +333,7 @@ This is how production deployment is set up. Repeat it only to connect a new Wor
 
    Click **Encrypt** for each value to store them as encrypted secrets.
 
-With this setup, every push to `main` triggers an automatic rebuild and deploy. You can disable automatic deployments or limit them to specific branches under **Settings > Builds & Deployments**.
+With this setup, every push to the production branch (`main`) triggers an automatic rebuild and deploy. The production branch is set under **Settings > Build > Branch control**. To keep building without deploying, change the deploy command to `npx wrangler versions upload`, which only uploads a new version. To stop builds altogether, disconnect the repository under **Settings > Build**.
 
 To roll back a deployment, navigate to **Workers & Pages > rusty-serp > Deployments**, find the version you want, and click **Rollback**.
 
