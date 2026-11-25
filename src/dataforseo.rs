@@ -54,12 +54,14 @@ const TASK_CREATED: i64 = 20100;
 /// task_get status codes for a task that has not finished: 40601 "Task Handed"
 /// (received, not yet queued) and 40602 "Task In Queue".
 const PENDING_STATUS_CODES: [i64; 2] = [40601, 40602];
-/// Top-level status codes with which DataForSEO turns a request away for the
-/// moment: 40202 (too many requests per minute) and 40209 (more than 30
-/// simultaneous requests, counted across everything that uses the account).
-/// They come with HTTP 200 and say nothing about the task, so a result request
-/// that gets one is treated like a pending task: the Worker waits and asks
-/// again, until the deadline.
+/// Status codes with which DataForSEO turns a request away for the moment:
+/// 40202 (too many requests per minute) and 40209 (more than 30 simultaneous
+/// requests, counted across everything that uses the account). They come with
+/// HTTP 200 and say nothing about the task, so a result request that gets one
+/// is treated like a pending task: the Worker waits and asks again, until the
+/// deadline. DataForSEO does not say where in the body they appear, and no
+/// finished task carries either one, so both the top-level code and
+/// `tasks[0]`'s are read.
 const BUSY_STATUS_CODES: [i64; 2] = [40202, 40209];
 /// DataForSEO reports its own server errors as HTTP 200 with a `status_code`
 /// from 50000 up. A result request that gets one counts as failed, since the
@@ -163,16 +165,24 @@ fn is_pending(codes: &StatusCodes, ai_optimized: bool) -> bool {
 }
 
 /// Whether DataForSEO turned a task_get request away for the moment (a rate
-/// limit) instead of reporting on the task. The top-level `status_code` is read
-/// in both formats.
+/// limit) instead of reporting on the task. The top-level `status_code` and
+/// `tasks[0].status_code` are both read, in both formats.
 fn is_busy(codes: &StatusCodes) -> bool {
-    codes
-        .status_code
-        .is_some_and(|code| BUSY_STATUS_CODES.contains(&code))
+    let task_code = codes
+        .tasks
+        .as_ref()
+        .and_then(|tasks| tasks.first())
+        .and_then(|task| task.status_code);
+    [codes.status_code, task_code]
+        .into_iter()
+        .flatten()
+        .any(|code| BUSY_STATUS_CODES.contains(&code))
 }
 
-/// Whether a task_get response is a DataForSEO server error rather than news
-/// of the task. The top-level `status_code` is read in both formats.
+/// Whether a task_get response has a top-level `status_code` of 50000 or
+/// higher, which counts as a failed request (see `FIRST_SERVER_ERROR`). The
+/// top-level code is read in both formats; a standard-format task that itself
+/// ended in such an error is a result and is not matched.
 fn is_server_error(codes: &StatusCodes) -> bool {
     codes
         .status_code
@@ -449,7 +459,8 @@ mod tests {
         );
         assert!(is_server_error(&ai));
 
-        // A task that itself ended in an error is a result: it is passed through.
+        // In the standard format, a task that itself ended in an error is a
+        // result: it is passed through.
         let task_error =
             codes(serde_json::json!({"status_code": 20000, "tasks": [{"status_code": 50000}]}));
         assert!(!is_server_error(&task_error));
@@ -459,11 +470,14 @@ mod tests {
     }
 
     #[test]
-    fn a_top_level_rate_limit_is_busy_and_not_a_result() {
+    fn a_rate_limit_is_busy_at_the_top_level_or_in_the_task() {
         for code in [40202, 40209] {
-            let standard = codes(serde_json::json!({"status_code": code, "tasks": null}));
-            assert!(is_busy(&standard));
-            assert!(!is_server_error(&standard));
+            let top_level = codes(serde_json::json!({"status_code": code, "tasks": null}));
+            assert!(is_busy(&top_level));
+            assert!(!is_server_error(&top_level));
+            let in_task =
+                codes(serde_json::json!({"status_code": 20000, "tasks": [{"status_code": code}]}));
+            assert!(is_busy(&in_task));
             let ai = codes(serde_json::json!({"status_code": code, "status_message": "busy"}));
             assert!(is_busy(&ai));
         }
@@ -471,6 +485,9 @@ mod tests {
         let done =
             codes(serde_json::json!({"status_code": 20000, "tasks": [{"status_code": 20000}]}));
         assert!(!is_busy(&done));
+        let task_error =
+            codes(serde_json::json!({"status_code": 20000, "tasks": [{"status_code": 40102}]}));
+        assert!(!is_busy(&task_error));
         let pending_ai = codes(serde_json::json!({"id": TASK_ID, "status_code": 40602}));
         assert!(!is_busy(&pending_ai));
     }

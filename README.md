@@ -186,7 +186,7 @@ All errors return a consistent JSON shape:
 | 405 | `method_not_allowed` | Wrong HTTP method for the path |
 | 500 | `missing_config` | Server secret not configured |
 | 502 | `dataforseo_error` | DataForSEO returned non-2xx or fetch failed. For a result request, three times in a row, where a DataForSEO server error (`status_code` 50000 or higher) also counts as a failure |
-| 504 | `dataforseo_timeout` | The task did not finish within 280 seconds (the body adds `dataforseo_task_id`), or a fetch-level timeout |
+| 504 | `dataforseo_timeout` | The Worker did not get the finished task within 280 seconds, because it was still running or DataForSEO's rate limits kept turning result requests away (the body adds `dataforseo_task_id`), or a request to DataForSEO timed out |
 
 **DataForSEO errors** include additional context:
 
