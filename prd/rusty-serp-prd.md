@@ -100,6 +100,7 @@ Adapted from the architecture patterns established in [rusty-gateway](https://gi
     - ai_optimized == true  -> .../task_get/advanced/{id}.ai
     - ai_optimized == false -> .../task_get/advanced/{id}
 13. Task status 40601 (Task Handed) or 40602 (Task In Queue) -> wait 6 s and repeat step 12
+    - a top-level 40202 or 40209 (DataForSEO's rate limits) is treated the same way
     - a failed result request (no full answer within 10 s, non-2xx, not JSON, or a status_code of 50000 or higher) is retried the same way; the third failure in a row -> 502 (504 if it timed out)
     - no answer within 280 s of step 11 -> 504 dataforseo_timeout with dataforseo_task_id
 14. Worker returns the finished task's response body verbatim with status 200
@@ -424,7 +425,7 @@ All error responses follow a consistent JSON schema:
 | 405 | `method_not_allowed` | Non-POST method on `/v1/serp`, non-GET/HEAD on `/v1/health` |
 | 500 | `missing_config` | `CSVKEY`, `DATAFORSEO_LOGIN`, or `DATAFORSEO_PASSWORD` secret is not configured |
 | 502 | `dataforseo_error` | DataForSEO returned an HTTP error (non-2xx status) or a body that is not JSON, **or** the outbound fetch to DataForSEO failed entirely (network error, DNS failure, TLS error). For the task_post request this happens on the first failure; result requests are retried, and the third failure in a row is returned. For result requests, a DataForSEO server error (HTTP 200 with a top-level `status_code` of 50000 or higher) also counts as a failure, because it says nothing about the task. When the fetch never reached DataForSEO, the response will have `"dataforseo_status": 0` — this tells the caller the failure was at the network level, not a DataForSEO HTTP error. |
-| 504 | `dataforseo_timeout` | The task did not finish within 280 seconds of being set. The body adds `"dataforseo_task_id"`; DataForSEO may still finish the task and charge for it. The same code, without the task ID, is returned when an outbound fetch fails with an error whose message contains "timeout" or "timed out", including when three result requests in a row each go unanswered for 10 seconds. That should be rare. If the caller's own timeout fires first, the caller gets no response at all (see Section 4.6). |
+| 504 | `dataforseo_timeout` | The task did not finish within 280 seconds of being set (or DataForSEO's rate limits turned result requests away until then). The body adds `"dataforseo_task_id"`; DataForSEO may still finish the task and charge for it. The same code, without the task ID, is returned when an outbound request, or reading its response, fails with an error whose message contains "timeout" or "timed out", including when three result requests in a row fail and the last one did not answer in full within 10 seconds. That should be rare. If the caller's own timeout fires first, the caller gets no response at all (see Section 4.6). |
 
 #### 3.4.4 DataForSEO Error Response
 
@@ -531,8 +532,8 @@ The Worker constructs the task_post body as a JSON array containing a single tas
 
 **task_get (polling):**
 1. Wait 10 seconds after the task is set, then request the result.
-2. A failed fetch, no full answer within 10 seconds, a non-2xx status, a body that is not JSON, or a DataForSEO server error (a top-level `status_code` of 50000 or higher, which DataForSEO sends with HTTP 200) counts as a failed request. The Worker retries it at the next interval; the third failure in a row is returned to the caller (`502` `dataforseo_error`, or `504` for a fetch-level timeout).
-3. Read the task's status code: `tasks[0].status_code` in the standard format, the top-level `status_code` in the `.ai` format. `40601` (Task Handed) and `40602` (Task In Queue) mean the task is still running: wait 6 seconds and ask again.
+2. A failed fetch, no full answer within 10 seconds, a non-2xx status, a body that is not JSON, or a DataForSEO server error (a top-level `status_code` of 50000 or higher, which DataForSEO sends with HTTP 200) counts as a failed request. The Worker retries it at the next interval; the third failure in a row is returned to the caller (`502` `dataforseo_error`, or `504` `dataforseo_timeout` when the last one timed out). In the `.ai` format the top-level code is also the task's own, so a task that itself ended with a code of 50000 or higher also ends as a `502` after three tries.
+3. Read the task's status code: `tasks[0].status_code` in the standard format, the top-level `status_code` in the `.ai` format. `40601` (Task Handed) and `40602` (Task In Queue) mean the task is still running: wait 6 seconds and ask again. A top-level `40202` or `40209` (DataForSEO's rate limits per minute and for simultaneous requests, sent with HTTP 200) says nothing about the task and is treated the same way.
 4. Any other status code, or none, means the task is finished: return the response body verbatim with status `200` and `Content-Type: application/json`. That includes task-level errors such as `40102` (no search results).
 5. If 280 seconds have passed since the task was set, return `504` `dataforseo_timeout` with `dataforseo_task_id` instead of asking again.
 
@@ -553,8 +554,8 @@ The Worker reads only the task ID and status codes. It does not validate or tran
 | Scenario | What the caller sees |
 |----------|---------------------|
 | The task finishes within 280 seconds | Normal `200` response with DataForSEO's JSON body, including task-level errors in its `status_code`. |
-| The task is still running after 280 seconds | A `504` JSON response with code `dataforseo_timeout` and `dataforseo_task_id`. DataForSEO may still finish the task and charge for it. |
-| Three result requests in a row fail (including timeouts and DataForSEO server errors) | A `502` `dataforseo_error` (or `504` `dataforseo_timeout` for a fetch-level timeout) describing the last failure. |
+| The task is still running after 280 seconds, or DataForSEO's rate limits turn result requests away until then | A `504` JSON response with code `dataforseo_timeout` and `dataforseo_task_id`. DataForSEO may still finish the task and charge for it. |
+| Three result requests in a row fail (including timeouts and DataForSEO server errors) | A `502` `dataforseo_error` (or `504` `dataforseo_timeout` if the last one timed out) describing the last failure. |
 | The caller's own timeout fires first | The caller gets nothing from rusty-serp; its HTTP client reports a timeout. Cloudflare may cancel the Worker, and the result is lost, though DataForSEO charged for the task when it was set. |
 | The Worker throws an exception or the connection drops | A non-JSON Cloudflare error page or a connection reset, **not** a structured JSON response. |
 
@@ -926,6 +927,7 @@ const _: () = assert!(DEADLINE_MS + POLL_TIMEOUT_MS as u64 <= 290_000);
 
 const TASK_CREATED: i64 = 20100;
 const PENDING_STATUS_CODES: [i64; 2] = [40601, 40602]; // Task Handed, Task In Queue
+const BUSY_STATUS_CODES: [i64; 2] = [40202, 40209]; // rate limits, sent with HTTP 200
 const FIRST_SERVER_ERROR: i64 = 50000; // DataForSEO server errors, sent with HTTP 200
 
 /// The status codes of a task_get response, and nothing else. Deserializing
@@ -959,20 +961,33 @@ fn task_get_url(task_id: &str, ai_optimized: bool) -> Option<String>
 /// in the standard format, the top-level status_code in the .ai format.
 fn is_pending(codes: &StatusCodes, ai_optimized: bool) -> bool
 
+/// Whether the top-level status_code is 40202 or 40209: DataForSEO's rate
+/// limits turned the request away, which says nothing about the task.
+fn is_busy(codes: &StatusCodes) -> bool
+
 /// Whether the top-level status_code is 50000 or higher: a DataForSEO server
 /// error, not news of the task.
 fn is_server_error(codes: &StatusCodes) -> bool
 
+/// Whether a failed request's error message contains "timeout" or "timed out".
+fn mentions_timeout(message: &str) -> bool
+
+/// A request that failed before its whole response arrived: 504
+/// dataforseo_timeout when mentions_timeout, otherwise 502 dataforseo_error
+/// with the HTTP status received so far (0 if none).
+fn request_failed(status: u16, message: String) -> Response
+
 /// One outbound request; returns the HTTP status and body text. A failed fetch
-/// becomes 502 dataforseo_error (dataforseo_status 0), or 504 dataforseo_timeout
-/// when the error message mentions a timeout. With timeout_ms, the request is
-/// abandoned (AbortSignal.timeout) if the whole response has not arrived in time.
+/// or body read becomes request_failed. With timeout_ms, the request is
+/// abandoned (AbortSignal.timeout) if the whole response has not arrived in
+/// time; workerd then reports "TimeoutError: The operation was aborted due to
+/// timeout", for a late body as for late headers.
 async fn send(url: &str, method: Method, auth_header: &str, body: Option<String>,
     timeout_ms: Option<u32>) -> std::result::Result<(u16, String), Response>
 
 /// One task_get request, limited to POLL_TIMEOUT_MS: Ok(Some(body)) when
-/// finished, Ok(None) while pending, Err for a failed fetch or timeout, a non-2xx
-/// status, a body without DataForSEO's status codes, or a server error.
+/// finished, Ok(None) while pending or busy, Err for a failed fetch or timeout,
+/// a non-2xx status, a body without DataForSEO's status codes, or a server error.
 async fn poll_once(url: &str, auth_header: &str, ai_optimized: bool)
     -> std::result::Result<Option<String>, Response>
 
@@ -1047,7 +1062,7 @@ pub async fn fetch_serp(
 }
 ```
 
-**Unit tests** (native, `cargo test`): the task_post body (priority and the three flags, for both formats and both location types), reading the task ID only from a created task, task_get URLs for both formats and rejection of non-UUID IDs, the pending check for both formats, the server-error check (top-level only), and reading status codes from a full result while rejecting a non-JSON body.
+**Unit tests** (native, `cargo test`): the task_post body (priority and the three flags, for both formats and both location types), reading the task ID only from a created task, task_get URLs for both formats and rejection of non-UUID IDs, the pending check for both formats, the server-error check (top-level only), the rate-limit check, recognizing timeout messages whether the headers or the body were late, and reading status codes from a full result while rejecting a non-JSON body.
 
 **Security notes:**
 - The `login` and `password` are never logged or included in error responses.
@@ -1165,7 +1180,7 @@ fn truncate(s: &str, max_bytes: usize) -> &str {
 ### 7.4 Known Limitations
 
 - **csvkey in URL**: The `csvkey` appears in the URL query string, which may be logged by intermediary proxies or in Cloudflare access logs. This is an accepted trade-off for consistency with the existing tool ecosystem (rusty-gateway, edgentities). Agents should use HTTPS exclusively.
-- **No rate limiting**: The Worker does not implement its own rate limiting. It relies on DataForSEO's built-in rate limits (2,000 requests/minute, 30 concurrent). A compromised csvkey could exhaust the DataForSEO account balance.
+- **No rate limiting**: The Worker does not implement its own rate limiting. It relies on DataForSEO's built-in rate limits (per DataForSEO's errors appendix in November 2026: 10,000 requests per minute and 30 simultaneous requests, for the whole account). Polling adds at most 46 short result requests per call; if a limit turns one away, the Worker asks again (Section 4.5). A compromised csvkey could exhaust the DataForSEO account balance.
 - **Single csvkey**: The Worker supports one csvkey per environment. Multiple keys (comma-separated, like edgentities) can be added as a future enhancement if needed.
 
 ---
@@ -1496,8 +1511,8 @@ For complete item schemas, refer to the [DataForSEO SERP API documentation](http
 | `40100` | Not authorized | Check DATAFORSEO_LOGIN/PASSWORD secrets |
 | `40102` | No search results | Return empty to user (valid query, no results) |
 | `40200` | Payment required | Alert operator, DataForSEO balance depleted |
-| `40202` | Rate limit exceeded | Retry after delay |
-| `40209` | Too many concurrent requests | Retry after delay |
+| `40202` | Rate limit exceeded | From task_post: retry after delay (no task was set). Never seen from a result request: the Worker waits and asks again |
+| `40209` | Too many simultaneous requests (more than 30) | Same as `40202` |
 | `40210` | Insufficient funds | Alert operator, DataForSEO balance too low |
 | `40501` | Invalid field | Check request construction |
 | `40601` / `40602` | Task handed / in queue | Never seen by agents: the Worker keeps polling while a task has these codes |

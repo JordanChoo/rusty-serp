@@ -54,9 +54,18 @@ const TASK_CREATED: i64 = 20100;
 /// task_get status codes for a task that has not finished: 40601 "Task Handed"
 /// (received, not yet queued) and 40602 "Task In Queue".
 const PENDING_STATUS_CODES: [i64; 2] = [40601, 40602];
+/// Top-level status codes with which DataForSEO turns a request away for the
+/// moment: 40202 (too many requests per minute) and 40209 (more than 30
+/// simultaneous requests, counted across everything that uses the account).
+/// They come with HTTP 200 and say nothing about the task, so a result request
+/// that gets one is treated like a pending task: the Worker waits and asks
+/// again, until the deadline.
+const BUSY_STATUS_CODES: [i64; 2] = [40202, 40209];
 /// DataForSEO reports its own server errors as HTTP 200 with a `status_code`
-/// from 50000 up. On a result request such an error says nothing about the
-/// task, which may still finish, so it counts as a failed request.
+/// from 50000 up. A result request that gets one counts as failed, since the
+/// task may still finish. (In the `.ai` format the top-level code is also the
+/// task's own, so a task that itself ended in such an error is asked for again
+/// too, and after three tries ends as a 502 rather than a 200.)
 const FIRST_SERVER_ERROR: i64 = 50000;
 
 /// The status codes of a task_get response, and nothing else.
@@ -153,6 +162,15 @@ fn is_pending(codes: &StatusCodes, ai_optimized: bool) -> bool {
     status.is_some_and(|code| PENDING_STATUS_CODES.contains(&code))
 }
 
+/// Whether DataForSEO turned a task_get request away for the moment (a rate
+/// limit) instead of reporting on the task. The top-level `status_code` is read
+/// in both formats.
+fn is_busy(codes: &StatusCodes) -> bool {
+    codes
+        .status_code
+        .is_some_and(|code| BUSY_STATUS_CODES.contains(&code))
+}
+
 /// Whether a task_get response is a DataForSEO server error rather than news
 /// of the task. The top-level `status_code` is read in both formats.
 fn is_server_error(codes: &StatusCodes) -> bool {
@@ -161,10 +179,29 @@ fn is_server_error(codes: &StatusCodes) -> bool {
         .is_some_and(|code| code >= FIRST_SERVER_ERROR)
 }
 
+/// Whether the error message of a failed request reports a timeout, such as
+/// the `TimeoutError` of a result request that ran past its limit.
+fn mentions_timeout(message: &str) -> bool {
+    let lower = message.to_lowercase();
+    lower.contains("timeout") || lower.contains("timed out")
+}
+
+/// The error for a request that failed before its whole response arrived:
+/// `504` `dataforseo_timeout` for a timeout, otherwise `502` `dataforseo_error`
+/// with the HTTP status received so far (0 if none).
+fn request_failed(status: u16, message: String) -> Response {
+    if mentions_timeout(&message) {
+        json_error(504, &message, "dataforseo_timeout").unwrap()
+    } else {
+        dataforseo_error(status, &message, None).unwrap()
+    }
+}
+
 /// Sends one request to DataForSEO and returns its status and body text.
 ///
 /// With `timeout_ms`, the request is abandoned if the whole response, body
-/// included, has not arrived in that time; it then fails as a timeout.
+/// included, has not arrived in that time; it then fails as a timeout (`504`),
+/// whether the headers or the body were late.
 async fn send(
     url: &str,
     method: Method,
@@ -201,29 +238,23 @@ async fn send(
         Some(signal) => fetch.send_with_signal(signal).await,
         None => fetch.send().await,
     };
-    let mut response = sent.map_err(|e| {
-        let err_msg = format!("Fetch failed: {}", e);
-        let err_lower = err_msg.to_lowercase();
-        if err_lower.contains("timeout") || err_lower.contains("timed out") {
-            json_error(504, &err_msg, "dataforseo_timeout").unwrap()
-        } else {
-            dataforseo_error(0, &err_msg, None).unwrap()
-        }
-    })?;
+    let mut response = sent.map_err(|e| request_failed(0, format!("Fetch failed: {e}")))?;
 
     let status = response.status_code();
-    let body_text = response.text().await.map_err(|e| {
-        dataforseo_error(status, &format!("Failed to read response: {}", e), None).unwrap()
-    })?;
+    let body_text = response
+        .text()
+        .await
+        .map_err(|e| request_failed(status, format!("Failed to read response: {e}")))?;
     Ok((status, body_text))
 }
 
 /// Asks DataForSEO for the task's result once.
 ///
 /// `Ok(Some(body))` is the finished task's response, `Ok(None)` means the task
-/// is still running, and `Err` is a failed request, which the caller may retry:
-/// a failed fetch or timeout, a non-2xx status, a body without DataForSEO's
-/// status codes, or a DataForSEO server error.
+/// is still running or DataForSEO's rate limit turned the request away, and
+/// `Err` is a failed request, which the caller may retry: a failed fetch or
+/// timeout, a non-2xx status, a body without DataForSEO's status codes, or a
+/// DataForSEO server error.
 async fn poll_once(
     url: &str,
     auth_header: &str,
@@ -239,7 +270,8 @@ async fn poll_once(
     if is_server_error(&codes) {
         return Err(dataforseo_error(status, &body_text, None).unwrap());
     }
-    Ok((!is_pending(&codes, ai_optimized)).then_some(body_text))
+    let not_ready = is_busy(&codes) || is_pending(&codes, ai_optimized);
+    Ok((!not_ready).then_some(body_text))
 }
 
 /// Wraps a DataForSEO response body, unchanged, in a `200` JSON response.
@@ -424,6 +456,35 @@ mod tests {
         let pending =
             codes(serde_json::json!({"status_code": 20000, "tasks": [{"status_code": 40602}]}));
         assert!(!is_server_error(&pending));
+    }
+
+    #[test]
+    fn a_top_level_rate_limit_is_busy_and_not_a_result() {
+        for code in [40202, 40209] {
+            let standard = codes(serde_json::json!({"status_code": code, "tasks": null}));
+            assert!(is_busy(&standard));
+            assert!(!is_server_error(&standard));
+            let ai = codes(serde_json::json!({"status_code": code, "status_message": "busy"}));
+            assert!(is_busy(&ai));
+        }
+
+        let done =
+            codes(serde_json::json!({"status_code": 20000, "tasks": [{"status_code": 20000}]}));
+        assert!(!is_busy(&done));
+        let pending_ai = codes(serde_json::json!({"id": TASK_ID, "status_code": 40602}));
+        assert!(!is_busy(&pending_ai));
+    }
+
+    #[test]
+    fn timeouts_are_recognized_whether_the_headers_or_the_body_were_late() {
+        // workerd's message when AbortSignal.timeout fires, as worker 0.9 formats it.
+        let aborted = "TimeoutError: The operation was aborted due to timeout";
+        assert!(mentions_timeout(&format!("Fetch failed: {aborted}")));
+        assert!(mentions_timeout(&format!(
+            "Failed to read response: {aborted}"
+        )));
+        assert!(mentions_timeout("Fetch failed: connection timed out"));
+        assert!(!mentions_timeout("Fetch failed: Network connection lost."));
     }
 
     #[test]
