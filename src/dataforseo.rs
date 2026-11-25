@@ -1,4 +1,4 @@
-use crate::errors::{dataforseo_error, json_error, task_timeout_error};
+use crate::errors::{dataforseo_error, json_error, rate_limited_error, task_timeout_error};
 use crate::validation::{Location, SerpRequest};
 use base64::Engine;
 use serde::Deserialize;
@@ -42,7 +42,8 @@ const MAX_POLL_FAILURES: u32 = 3;
 /// `POLL_INTERVAL_MS`, as long as the next attempt starts within this time of
 /// the first (counted from the same moment as the deadline). Such a request set
 /// no task and cost nothing. A minute outlasts the per-minute limit and still
-/// leaves the task about 220 seconds before the deadline.
+/// leaves the task about 220 seconds before the deadline. If DataForSEO still
+/// turns it away after that, the Worker answers `429` `dataforseo_rate_limited`.
 const POST_RETRY_WINDOW_MS: u64 = 60_000;
 /// Cloudflare's cutoff for an outbound request whose server sends nothing.
 const CLOUDFLARE_CUTOFF_MS: u64 = 125_000;
@@ -324,7 +325,8 @@ fn pass_through(body_text: String) -> std::result::Result<Response, Response> {
 /// task_post response whose task was not created (an invalid field or an empty
 /// balance, for example), because it carries DataForSEO's error in its
 /// `status_code` the same way. A task_post that DataForSEO's rate limits turn
-/// away is first sent again for up to `POST_RETRY_WINDOW_MS`.
+/// away is sent again for up to `POST_RETRY_WINDOW_MS`, and is answered with
+/// `429` `dataforseo_rate_limited` if it is still turned away then.
 pub async fn fetch_serp(
     request: &SerpRequest,
     login: &str,
@@ -360,6 +362,10 @@ pub async fn fetch_serp(
         Delay::from(Duration::from_millis(POLL_INTERVAL_MS)).await;
     };
 
+    // Still turned away when the resend window closed: no task, nothing paid.
+    if post_is_busy(&post_body) {
+        return Err(rate_limited_error(&post_text).unwrap());
+    }
     let Some(task_id) = created_task_id(&post_body) else {
         return pass_through(post_text);
     };

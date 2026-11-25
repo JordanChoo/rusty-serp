@@ -96,6 +96,7 @@ Adapted from the architecture patterns established in [rusty-gateway](https://gi
 11. Worker sends POST to .../task_post with Basic Auth
     - non-2xx or unreadable response -> 502
     - turned away by a rate limit (40202 or 40209, at the top level or in tasks[0]; no task set, nothing paid) -> wait 6 s and send it again, while the next attempt starts within 60 s of the first
+    - still turned away by a rate limit once that minute is up -> 429 dataforseo_rate_limited (Retry-After: 60)
     - task not created (tasks[0].status_code != 20100) -> return the task_post response verbatim with status 200
 12. Worker waits 10 s, then sends GET with Basic Auth to the result URL:
     - ai_optimized == true  -> .../task_get/advanced/{id}.ai
@@ -424,6 +425,7 @@ All error responses follow a consistent JSON schema:
 | 401 | `unauthorized` | `csvkey` does not match the `CSVKEY` secret |
 | 404 | `not_found` | Unrecognized path |
 | 405 | `method_not_allowed` | Non-POST method on `/v1/serp`, non-GET/HEAD on `/v1/health` |
+| 429 | `dataforseo_rate_limited` | DataForSEO's rate limits (`40202` or `40209`) still turned task_post away after the Worker resent it for a minute (Section 4.5). No task was set and nothing was paid, so the caller can safely retry later. The response has a `Retry-After: 60` header, and the body adds `"dataforseo_body"` with DataForSEO's last task_post response, truncated to 4 KB. |
 | 500 | `missing_config` | `CSVKEY`, `DATAFORSEO_LOGIN`, or `DATAFORSEO_PASSWORD` secret is not configured |
 | 502 | `dataforseo_error` | DataForSEO returned an HTTP error (non-2xx status) or a body that is not JSON, **or** the outbound fetch to DataForSEO failed entirely (network error, DNS failure, TLS error). For the task_post request this happens on the first failure; result requests are retried, and the third failure in a row is returned. For result requests, a DataForSEO server error (HTTP 200 with a top-level `status_code` of 50000 or higher) also counts as a failure, because the task may still finish. When the fetch never reached DataForSEO, the response will have `"dataforseo_status": 0` — this tells the caller the failure was at the network level, not a DataForSEO HTTP error. |
 | 504 | `dataforseo_timeout` | The task did not finish within 280 seconds of being set (or DataForSEO's rate limits turned result requests away until then). The body adds `"dataforseo_task_id"`; DataForSEO may still finish the task and charge for it. The same code, without the task ID, is returned when an outbound request, or reading its response, fails with an error whose message contains "timeout" or "timed out", including when three result requests in a row fail and the last one did not answer in full within 10 seconds. That should be rare. If the caller's own timeout fires first, the caller gets no response at all (see Section 4.6). |
@@ -529,7 +531,7 @@ The Worker constructs the task_post body as a JSON array containing a single tas
 **task_post:**
 1. **Read the response body as text.** This is done regardless of status code to capture error details.
 2. **Check HTTP status code.** If not in the 2xx range, or the body is not JSON, return a `502` `dataforseo_error` response with the upstream status and truncated body.
-3. **Check that the task was created** (`tasks[0].status_code` is `20100`). If DataForSEO's rate limits turned the request away instead (`40202` or `40209`, in the top-level `status_code` or in `tasks[0]`), no task was set and nothing was paid: wait 6 seconds and send it again, as long as the next attempt starts within 60 seconds of the first. A minute outlasts the per-minute limit and still leaves the task about 220 seconds before the deadline. Otherwise, or once that minute is up, return the task_post response verbatim with status `200`: it carries DataForSEO's error (for example `40501` invalid field or `40210` insufficient funds) in `tasks[0].status_code`, like any other task-level error.
+3. **Check that the task was created** (`tasks[0].status_code` is `20100`). If DataForSEO's rate limits turned the request away instead (`40202` or `40209`, in the top-level `status_code` or in `tasks[0]`), no task was set and nothing was paid: wait 6 seconds and send it again, as long as the next attempt starts within 60 seconds of the first. A minute outlasts the per-minute limit and still leaves the task about 220 seconds before the deadline. If a rate limit still turns it away once that minute is up, return `429` `dataforseo_rate_limited` with `Retry-After: 60`. For any other response without a created task, return the task_post response verbatim with status `200`: it carries DataForSEO's error (for example `40501` invalid field or `40210` insufficient funds) in `tasks[0].status_code`, like any other task-level error.
 
 **task_get (polling):**
 1. Wait 10 seconds after the task is set, then request the result.
@@ -555,13 +557,13 @@ The Worker reads only the task ID and status codes. It does not validate or tran
 | Scenario | What the caller sees |
 |----------|---------------------|
 | The task finishes within 280 seconds | Normal `200` response with DataForSEO's JSON body, including task-level errors in its `status_code`. |
-| DataForSEO's rate limits still turn task_post away after a minute of resending | A `200` with DataForSEO's task_post response, carrying `40202` or `40209` in its `status_code`. No task was set and nothing was paid; retry later. |
+| DataForSEO's rate limits still turn task_post away after a minute of resending | A `429` JSON response with code `dataforseo_rate_limited`, `Retry-After: 60`, and DataForSEO's last answer in `dataforseo_body`. No task was set and nothing was paid; retry later. |
 | The task is still running after 280 seconds, or DataForSEO's rate limits turn result requests away until then | A `504` JSON response with code `dataforseo_timeout` and `dataforseo_task_id`. DataForSEO may still finish the task and charge for it. |
 | Three result requests in a row fail (including timeouts and DataForSEO server errors) | A `502` `dataforseo_error` (or `504` `dataforseo_timeout` if the last one timed out) describing the last failure. |
 | The caller's own timeout fires first | The caller gets nothing from rusty-serp; its HTTP client reports a timeout. Cloudflare may cancel the Worker, and the result is lost, though DataForSEO charged for the task when it was set. |
 | The Worker throws an exception or the connection drops | A non-JSON Cloudflare error page or a connection reset, **not** a structured JSON response. |
 
-**Implication for agents:** Set the agent tool timeout to 300 seconds. The Worker answers by about 290 seconds at the latest (its 280-second deadline plus one result request, which it abandons after 10 seconds), so a 300-second timeout always gets the Worker's answer. Agents should handle a `200` with a task-level error in `status_code`, a `504` `dataforseo_timeout`, a `502` `dataforseo_error`, and a non-JSON error page or connection reset.
+**Implication for agents:** Set the agent tool timeout to 300 seconds. The Worker answers by about 290 seconds at the latest (its 280-second deadline plus one result request, which it abandons after 10 seconds), so a 300-second timeout always gets the Worker's answer. Agents should handle a `200` with a task-level error in `status_code`, a `429` `dataforseo_rate_limited` (retry after a minute or more), a `504` `dataforseo_timeout`, a `502` `dataforseo_error`, and a non-JSON error page or connection reset.
 
 ### 4.7 Cost Implications
 
@@ -1057,6 +1059,10 @@ pub async fn fetch_serp(
         Delay::from(Duration::from_millis(POLL_INTERVAL_MS)).await;
     };
 
+    // Still turned away when the resend window closed: no task, nothing paid.
+    if post_is_busy(&post_body) {
+        return Err(rate_limited_error(&post_text).unwrap());
+    }
     // 2. A task that was not created carries DataForSEO's error: pass it through.
     let Some(task_id) = created_task_id(&post_body) else {
         return pass_through(post_text);
@@ -1121,6 +1127,13 @@ pub fn dataforseo_error(
 /// deadline (always HTTP 504, code "dataforseo_timeout"). The body adds
 /// "dataforseo_task_id", because DataForSEO may still finish and charge for it.
 pub fn task_timeout_error(task_id: &str) -> Result<Response>
+
+/// Build the response for a task_post that DataForSEO's rate limits still turn
+/// away after the Worker's minute of resending (always HTTP 429, code
+/// "dataforseo_rate_limited", header Retry-After: 60). No task was set and
+/// nothing was paid. The body adds "dataforseo_body", the last task_post
+/// response, truncated like dataforseo_error's.
+pub fn rate_limited_error(dfs_body: &str) -> Result<Response>
 
 /// Truncate a string to max_bytes at a UTF-8 character boundary.
 fn truncate(s: &str, max_bytes: usize) -> &str
@@ -1208,7 +1221,7 @@ fn truncate(s: &str, max_bytes: usize) -> &str {
 ### 7.4 Known Limitations
 
 - **csvkey in URL**: The `csvkey` appears in the URL query string, which may be logged by intermediary proxies or in Cloudflare access logs. This is an accepted trade-off for consistency with the existing tool ecosystem (rusty-gateway, edgentities). Agents should use HTTPS exclusively.
-- **No rate limiting**: The Worker does not implement its own rate limiting. It relies on DataForSEO's built-in rate limits (per DataForSEO's errors appendix in November 2026: 10,000 requests per minute and 30 simultaneous requests, for the whole account). Polling adds at most 46 short result requests per call. If a limit turns a result request away, the Worker asks again; if it turns task_post away, the Worker sends it again for up to a minute (Section 4.5). A compromised csvkey could exhaust the DataForSEO account balance.
+- **No rate limiting**: The Worker does not implement its own rate limiting. It relies on DataForSEO's built-in rate limits (per DataForSEO's errors appendix in November 2026: 10,000 requests per minute and 30 simultaneous requests, for the whole account). Polling adds at most 46 short result requests per call. If a limit turns a result request away, the Worker asks again; if it turns task_post away, the Worker sends it again for up to a minute and then answers `429` `dataforseo_rate_limited` (Section 4.5). A compromised csvkey could exhaust the DataForSEO account balance.
 - **Single csvkey**: The Worker supports one csvkey per environment. Multiple keys (comma-separated, like edgentities) can be added as a future enhancement if needed.
 
 ---
@@ -1539,7 +1552,7 @@ For complete item schemas, refer to the [DataForSEO SERP API documentation](http
 | `40100` | Not authorized | Check DATAFORSEO_LOGIN/PASSWORD secrets |
 | `40102` | No search results | Return empty to user (valid query, no results) |
 | `40200` | Payment required | Alert operator, DataForSEO balance depleted |
-| `40202` | Rate limit exceeded | From task_post, the Worker sends it again every 6 seconds for up to a minute (no task was set, nothing paid); if it is still turned away, the response is passed through: retry later. Never seen from a result request: the Worker waits and asks again |
+| `40202` | Rate limit exceeded | Never seen by agents. From task_post, the Worker sends it again every 6 seconds for up to a minute (no task was set, nothing paid), then answers `429` `dataforseo_rate_limited`: retry later. From a result request, the Worker waits and asks again |
 | `40209` | Too many simultaneous requests (more than 30) | Same as `40202` |
 | `40210` | Insufficient funds | Alert operator, DataForSEO balance too low |
 | `40501` | Invalid field | Check request construction |

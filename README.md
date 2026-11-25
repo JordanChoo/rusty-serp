@@ -49,7 +49,7 @@ rusty-serp centralizes all of this behind a single HTTP endpoint. Agents send a 
 
 Cloudflare ends a Worker's outbound request with a `524` error when the server sends nothing for 125 seconds (its [Proxy Read Timeout](https://developers.cloudflare.com/fundamentals/reference/connection-limits/), which only Enterprise zones can raise). With redirect resolution and the poisoned-result check always on, DataForSEO needs longer than that, so a single Live request was cut off. Instead, the Worker sets a task and polls for it, and every one of those requests returns at once. Only the Worker's answer to its caller takes long, and Cloudflare doesn't cut that off: a test Worker answered after 200 seconds.
 
-The Worker gives up after 280 seconds and answers `504` with code `dataforseo_timeout`. It abandons any result request that takes longer than 10 seconds, so it answers within about 290 seconds even if DataForSEO stops responding. If DataForSEO's rate limits (`40202`, `40209`) turn a result request away, the Worker waits and asks again, as it does for an unfinished task. If they turn the task request away, no task was set and nothing was paid, so the Worker sends it again every 6 seconds for up to a minute; after that it returns DataForSEO's answer with that `status_code`. One call makes at most 47 requests to DataForSEO, within the 50 that the Workers Free plan allows. The Worker reads only the status codes from each result, without building the rest of the document, so even a large result costs little CPU time.
+The Worker gives up after 280 seconds and answers `504` with code `dataforseo_timeout`. It abandons any result request that takes longer than 10 seconds, so it answers within about 290 seconds even if DataForSEO stops responding. If DataForSEO's rate limits (`40202`, `40209`) turn a result request away, the Worker waits and asks again, as it does for an unfinished task. If they turn the task request away, no task was set and nothing was paid, so the Worker sends it again every 6 seconds for up to a minute; after that it answers `429` with code `dataforseo_rate_limited`. One call makes at most 47 requests to DataForSEO, within the 50 that the Workers Free plan allows. The Worker reads only the status codes from each result, without building the rest of the document, so even a large result costs little CPU time.
 
 ### Module Structure
 
@@ -184,6 +184,7 @@ All errors return a consistent JSON shape:
 | 401 | `unauthorized` | `csvkey` does not match the secret |
 | 404 | `not_found` | Unrecognized path |
 | 405 | `method_not_allowed` | Wrong HTTP method for the path |
+| 429 | `dataforseo_rate_limited` | DataForSEO's rate limits (`40202`, `40209`) still turned the task request away after a minute of resending. No task was set and nothing was paid: retry later. The response has `Retry-After: 60` and DataForSEO's last answer in `dataforseo_body` |
 | 500 | `missing_config` | Server secret not configured |
 | 502 | `dataforseo_error` | DataForSEO returned non-2xx or fetch failed. For a result request, three times in a row, where a DataForSEO server error (`status_code` 50000 or higher) also counts as a failure |
 | 504 | `dataforseo_timeout` | The Worker did not get the finished task within 280 seconds, because it was still running or DataForSEO's rate limits kept turning result requests away (the body adds `dataforseo_task_id`), or a request to DataForSEO timed out |
@@ -264,6 +265,7 @@ serp_tool = Tool(
 - **Set `depth` conservatively.** Start with `10` (default). Each additional 10 results adds ~$0.0012.
 - **Check `status_code` in the response body.** A `200` HTTP response does not guarantee SERP success; look for `20000` in the JSON.
 - **Set agent tool timeout to 300 seconds.** Redirect resolution and the poisoned-result check are always on. DataForSEO caps redirect resolution at 260 seconds in total and gives no time figure for the check; in testing, requests took 145 to 186 seconds. The Worker gives up at 280 seconds and answers `504`, and abandons any result request after 10 seconds, so it answers within about 290 seconds and a 300-second client timeout always gets the Worker's answer.
+- **Retry a `429` later.** It means DataForSEO's rate limits outlasted the Worker's minute of resending; nothing was paid, so trying again after a minute or more is safe.
 - **Handle non-JSON errors.** If the Worker throws an exception or the connection drops, agents receive a Cloudflare HTML error page or a connection reset, not a JSON response.
 
 ## Common Location Codes
